@@ -1,0 +1,20 @@
+# Default configuration for project
+
+data:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  processed_file: processed_data.h5
+  splits_dir: data/raw_splits
+
+model:
+  input_dim: 128
+  phi_hidden_dims: [64, 64]
+  rho_hidden_dims: [64, 32]
+
+training:
+  batch_size: 32
+  num_workers: 4
+  epochs: 10
+  lr: 0.001
+  balance_buckets: true
+  num_buckets: 4
