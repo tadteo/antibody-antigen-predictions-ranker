@@ -1,6 +1,6 @@
 # Ignore all files in the data directory except for the manifest.csv
-data/manifest.csv
 data/*
+!data/manifest.csv
 
 # Ignore all files in the logs directory
 logs/*
