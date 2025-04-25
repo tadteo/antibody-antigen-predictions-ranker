@@ -2,6 +2,8 @@
 data/*
 !data/manifest.csv
 
+wandb/*
+
 # Ignore all files in the logs directory
 logs/*
 

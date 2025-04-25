@@ -23,13 +23,14 @@ import pandas as pd
 import numpy as np
 import h5py
 from sklearn.model_selection import train_test_split
+import yaml
 
 # Global DockQ bin edges
 BIN_EDGES = [0.0, 0.25, 0.50, 0.75, 1.00]
 NUM_BUCKETS = len(BIN_EDGES) - 1
 
 
-def build_manifest(h5_dir, val_frac, test_frac, seed, out_csv):
+def build_manifest(h5_dir, val_frac, test_frac, seed, out_csv, config):
     rows = []
     num_complexes = 0
     # 1. iterate complexes
@@ -45,23 +46,31 @@ def build_manifest(h5_dir, val_frac, test_frac, seed, out_csv):
             # get complex_id
             for complex_id in hf.keys():
                 id = complex_id
-
+                is_complex_valid = True
                 for sample in hf[complex_id].keys():
                     dockq = float(hf[f"{complex_id}/{sample}/abag_dockq"][()])
                     bucket = np.digitize(dockq, BIN_EDGES, right=False) - 1
                     # Skip if DockQ is NaN
                     if np.isnan(dockq):
-                        continue
+                        is_complex_valid = False
+                        break
                     else:
                         rows.append({
                             'complex_id': id,
                             'h5_file': h5_path,
                             'sample': sample,
+                            'len_sample': len(hf[f"{complex_id}/{sample}/interchain_pae_vals"][()]),
                             'label': dockq,
                             'bucket': int(bucket),
+                            'weight_complex': None,
+                            'weight_bucket': None,
+                            'weight': None,
                             'split': None
                         })
-                        num_complexes += 1
+
+                if is_complex_valid:
+                    num_complexes += 1
+
 
     print(f"Found {num_complexes} valid complexes with a total of {len(rows)} samples")
     df = pd.DataFrame(rows)
@@ -171,11 +180,24 @@ def build_manifest(h5_dir, val_frac, test_frac, seed, out_csv):
         print(f"    per‐complex mean: mean={sub_mean.mean():.3f}, std={sub_mean.std():.3f}")
 
 
+    # Add the split and weight column to the df
+    df['split'] = df['complex_id'].map(split_map)
+
+    complex_counts = df['complex_id'].value_counts().to_dict()
+    df['weight_complex'] = df['complex_id'].map(lambda c: complex_counts[c] / config['num_samples_per_complex'])
+
+    # compute weight for each bucket    
+    bucket_counts = df['bucket'].value_counts().to_dict()
+    df['weight_bucket'] = df['bucket'].map(lambda b: 1.0 / bucket_counts[b])
+
+    # final weight is product of the two:
+    df['weight'] = df['weight_complex'] * df['weight_bucket']
+    # normalize the weights so they sum to 1
+    df['weight'] /= df['weight'].sum()
+
 
     # Write to CSV the manifest for each sample and apply the correct split to each sample
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
-    # Add the split column to the df
-    df['split'] = df['complex_id'].map(split_map)
     df.to_csv(out_csv, index=False)
 
 
@@ -193,11 +215,14 @@ def parse_args():
                    help='Random seed for reproducibility')
     p.add_argument('--out_csv', default='data/manifest.csv',
                    help='Output path for manifest CSV')
+    p.add_argument('--config', type=str, default='configs/config.yaml', help='Path to YAML config file')
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
     if args.val_frac + args.test_frac >= 1.0:
         raise ValueError("val_frac + test_frac must be < 1.0")
     build_manifest(
@@ -205,7 +230,8 @@ def main():
         val_frac=args.val_frac,
         test_frac=args.test_frac,
         seed=args.seed,
-        out_csv=args.out_csv
+        out_csv=args.out_csv,
+        config=config
     )
 
 
