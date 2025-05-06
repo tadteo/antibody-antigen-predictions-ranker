@@ -49,6 +49,10 @@ def build_manifest(h5_dir, val_frac, test_frac, seed, out_csv, config):
                 is_complex_valid = True
                 for sample in hf[complex_id].keys():
                     dockq = float(hf[f"{complex_id}/{sample}/abag_dockq"][()])
+                    ptm = float(hf[f"{complex_id}/{sample}/ptm"][()])
+                    iptm = float(hf[f"{complex_id}/{sample}/iptm"][()])
+                    ranking_confidence = float(hf[f"{complex_id}/{sample}/ranking_confidence"][()])
+                    tm_normalized = float(hf[f"{complex_id}/{sample}/tm_normalized_reference"][()])
                     bucket = np.digitize(dockq, BIN_EDGES, right=False) - 1
                     # Skip if DockQ is NaN
                     if np.isnan(dockq):
@@ -61,8 +65,11 @@ def build_manifest(h5_dir, val_frac, test_frac, seed, out_csv, config):
                             'sample': sample,
                             'len_sample': len(hf[f"{complex_id}/{sample}/interchain_pae_vals"][()]),
                             'label': dockq,
+                            'ptm': ptm,
+                            'iptm': iptm,
+                            'ranking_confidence': ranking_confidence,
+                            'tm_normalized': tm_normalized,
                             'bucket': int(bucket),
-                            'weight_complex': None,
                             'weight_bucket': None,
                             'weight': None,
                             'split': None
@@ -183,18 +190,44 @@ def build_manifest(h5_dir, val_frac, test_frac, seed, out_csv, config):
     # Add the split and weight column to the df
     df['split'] = df['complex_id'].map(split_map)
 
-    complex_counts = df['complex_id'].value_counts().to_dict()
-    df['weight_complex'] = df['complex_id'].map(lambda c: complex_counts[c] / config['num_samples_per_complex'])
+    #for each split, compute the weight of the complexes
+    for split in ['train','val','test']:
+        sub_df = df[df['split']==split]
+        
+        # compute weight for each bucket    
+        bucket_counts = sub_df['bucket'].value_counts().to_dict()
+        sub_df['weight_bucket'] = sub_df['bucket'].map(lambda b: 1.0 / bucket_counts[b])
 
-    # compute weight for each bucket    
-    bucket_counts = df['bucket'].value_counts().to_dict()
-    df['weight_bucket'] = df['bucket'].map(lambda b: 1.0 / bucket_counts[b])
+        #divide the weight_bucket by the number of buckets
+        sub_df['weight_bucket'] = sub_df['weight_bucket'] / NUM_BUCKETS
 
-    # final weight is product of the two:
-    df['weight'] = df['weight_complex'] * df['weight_bucket']
-    # normalize the weights so they sum to 1
-    df['weight'] /= df['weight'].sum()
+        # final weight is product of the two:
+        # df['weight'] = df['weight_complex']
+        sub_df['weight'] = sub_df['weight_bucket']
 
+        #add the weight to the df
+        df.loc[df['split']==split, 'weight_bucket'] = sub_df['weight_bucket']
+        df.loc[df['split']==split, 'weight'] = sub_df['weight']
+
+
+    #check for each split that the weight bucket is correct
+    for split in ['train','val','test']:
+        sub_df = df[df['split']==split]
+        #count the number of elements in each bucket
+        bucket_counts = sub_df['bucket'].value_counts().to_dict()
+        # calculate the weight of each bucket
+        bucket_weights = []
+        for b in bucket_counts:
+            bucket_weights.append(bucket_counts[b]/len(sub_df))
+
+        for bucket in bucket_counts:
+            print(f"The weight bucket for the {split} split is {bucket_weights[bucket]}")
+        print(f"The sum of the weights for the {split} split is {sum(bucket_weights)}")
+        
+    #check that the sum of the weights is 1 for each split
+    for split in ['train','val','test']:
+        sub_df = df[df['split']==split]
+        print(f"The sum of the weights for the {split} split is {sub_df['weight'].sum()}")
 
     # Write to CSV the manifest for each sample and apply the correct split to each sample
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
@@ -213,7 +246,7 @@ def parse_args():
                    help='Fraction for test split')
     p.add_argument('--seed', type=int, default=42,
                    help='Random seed for reproducibility')
-    p.add_argument('--out_csv', default='data/manifest.csv',
+    p.add_argument('--out_csv', default='data/manifest_with_ptm_no_normalization.csv',
                    help='Output path for manifest CSV')
     p.add_argument('--config', type=str, default='configs/config.yaml', help='Path to YAML config file')
     return p.parse_args()

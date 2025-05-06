@@ -1,0 +1,1 @@
+/proj/berzelius-2021-29/users/x_matta/abag/output/FineTune_high_variance_20250505_1357/finetune_high_variance_epoch210.pt

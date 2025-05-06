@@ -8,6 +8,7 @@ import h5py
 import torch
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, Sampler
 import torch.nn.functional as F
+from src.data.triangular_positional_encoding import triangular_encode_features
 
 # ==============================================================================
 # Load our user‐config (e.g. number of models to draw per complex per epoch)
@@ -21,31 +22,29 @@ with open('configs/config.yaml', 'r') as f:
 # ==============================================================================
 
 def pad_collate_fn(batch):
-    """
-    Collate function that pads 3×n_i feature tensors across the batch
-    to shape (batch_size, 3, max_n), stacking labels and weights.
-    """
-    # Extract lists
-    features = [item["features"] for item in batch]
+    features = [item["features"] for item in batch]  # each is [3, n_i]
     labels   = torch.stack([item["label"]  for item in batch])
     weights  = torch.stack([item["weight"] for item in batch])
 
-    # Find max sequence length
-    max_n = max(feat.size(1) for feat in features)
+    lengths = [feat.size(1) for feat in features]    # record each n_i
+    max_n   = max(lengths)
+
     padded_feats = []
-    for feat in features:
-        pad = max_n - feat.size(1)
-        # pad on right of dim=1 (the varying n‐axis), no pad on dim=0
-        padded = F.pad(feat, (0, pad, 0, 0), value=0)
+    for feat, L in zip(features, lengths):
+        pad = max_n - L
+        # pad on the *right* of dim=1 (the varying-n axis)
+        padded = F.pad(feat, (0, pad, 0, 0), value=0.0)
         padded_feats.append(padded)
 
-    # Stack into a single tensor of shape (batch_size, 3, max_n)
-    features = torch.stack(padded_feats, dim=0)
-    # swap to (batch_size, max_n, 3) so that set_size=max_n and input_dim=3
-    features = features.permute(0, 2, 1)
+    # stack into (batch_size, 3, max_n) then permute to (B, max_n, 3)
+    features = torch.stack(padded_feats, dim=0).permute(0, 2, 1)
 
-    return {"features": features, "label": labels, "weight": weights}
-
+    return {
+      "features": features,        # [B, set_size, input_dim]
+      "lengths":  torch.tensor(lengths, dtype=torch.long),
+      "label":    labels,
+      "weight":   weights
+    }
 
 # ==============================================================================
 # WeightedPerComplexSampler
@@ -81,73 +80,35 @@ class WeightedPerComplexSampler(Sampler):
         self.replacement = replacement
         self.rng = np.random.RandomState(seed)
 
-        #order the df by the len_sample
-        self.df = self.df.sort_values(by="len_sample", ascending=False)
-
-        # Build mapping: complex_id -> list of (index, weight, len_sample)
-        self.by_complex = {}
-        for idx, (cid, w, len_sample) in enumerate(zip(self.df["complex_id"],
-                                           self.df["weight"],
-                                           self.df["len_sample"])):
-            self.by_complex.setdefault(cid, []).append((idx, w, len_sample))
-
-        self.sorted_complex_ids = list(self.by_complex.keys())
-        #print the complex_id and the length of samples of all sorted complexes
-        # for cid in self.complex_ids:
-        #     print(f"{cid}: {self.by_complex[cid][0][2]}")
+        # number of complexes in the df
+        self.number_of_complexes = len(self.df["complex_id"].unique())
 
     def __iter__(self):
+        # Get the indices to sample from
+        indices = np.arange(len(self.df))
+        # Sample from indices using the weights
+        if self.weighted:
+            sampled_indices = self.rng.choice(indices, size=(self.M*self.complexes_per_batch), replace=False, p=self.df["weight"].values)
+        else:
+            sampled_indices = self.rng.choice(indices, size=(self.M*self.complexes_per_batch), replace=False)
         
-        all_idxs = []
 
-        # create complexes blocks of batch_size given the len_sample
+        # Get the samples and their lengths
+        samples = self.df.iloc[sampled_indices]
+        samples = samples.sort_values(by="len_sample", ascending=False)
+        
+        # Create blocks of indices (not DataFrame slices)
         blocks = [
-            self.sorted_complex_ids[i : i + self.complexes_per_batch]
-            for i in range(0, len(self.sorted_complex_ids), self.complexes_per_batch)
+            sampled_indices[i : i + self.complexes_per_batch]
+            for i in range(0, len(sampled_indices), self.complexes_per_batch)
         ]
-        
-        
+        # Yield integer indices, not DataFrame slices
         for block in blocks:
-
-            samples_per_complexes_in_block = []
-            for cid in block:
-                idx_w_triples = self.by_complex[cid]
-                
-                idxs, weights, len_sample = zip(*idx_w_triples)
-                if self.weighted:
-                    probs = np.array(weights, dtype=np.float64)
-                    probs /= probs.sum()  # normalize
-                else:
-                    probs = np.ones(len(idxs)) / len(idxs)
-
-                # draw M times
-                chosen = self.rng.choice(
-                    a=idxs,
-                    size=self.M,
-                    replace=self.replacement,
-                    p=probs
-                )
-                samples_per_complexes_in_block.extend(chosen.tolist())
-            
-            #print the length of the chosen
-            # print(len(samples_per_complexes_in_block) == self.M * len(block))
-
-            # Now we have a list of `len(block)` lists, each of length M.
-            # We'll build M batches of size len(block).
-            for i in range(self.M):
-                #first we shuffle the samples_per_complexes_in_block
-                self.rng.shuffle(samples_per_complexes_in_block)
-                #then we build the batch
-                batch = []
-                for j in range(len(block)):
-                    batch.append(samples_per_complexes_in_block[i*len(block) + j])
-                # print(batch)
-                yield batch
-            
+            yield block.tolist()  # Convert numpy array to list of integers
 
     def __len__(self):
         # total draws per epoch
-        return len(self.sorted_complex_ids) * self.M
+        return len(self.number_of_complexes) * self.M
 
 
 # ==============================================================================
@@ -200,7 +161,13 @@ class AntibodyAntigenPAEDataset(Dataset):
 
         # Optional user‐provided transform
         if self.feature_transform:
+            # print("Applying feature transform")
             feats = self.feature_transform(feats)
+
+        #print first 10 features or indexes
+        # print(feats[:10])
+        # print(feats[1][:10])
+        # print(feats[2][:10])
 
         return {
             "features": torch.from_numpy(feats),            # [3, n]
@@ -215,11 +182,17 @@ class AntibodyAntigenPAEDataset(Dataset):
 def get_eval_dataloader(manifest_csv: str,
                         split: str,
                         batch_size: int = 32,
-                        num_workers: int = 4):
+                        num_workers: int = 4,
+                        feature_transform: bool = False,
+                        seed: int = None):
     """
     DataLoader for evaluation: sequential (no shuffle), no special sampling.
     """
-    dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split)
+    if feature_transform:
+        print("Using triangular positional encoding")
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features)
+    else:
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split)
     return DataLoader(dataset,
                       batch_size=batch_size,
                       shuffle=False,
@@ -237,6 +210,7 @@ def get_dataloader(manifest_csv: str,
                    num_workers: int = 4,
                    samples_per_complex: int = None,
                    bucket_balance: bool = False,
+                   feature_transform: bool = False,
                    seed: int = None):
     """
     Priority of sampling strategies:
@@ -245,11 +219,17 @@ def get_dataloader(manifest_csv: str,
       3) If bucket_balance only          → use WeightedRandomSampler (global)
       4) Else                            → plain shuffle
     """
-    dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split)
+    if feature_transform:
+        print("Using triangular positional encoding")
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features)
+    else:
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split)
     df      = dataset.df
 
+    
     # Case 1: both constraints
     if samples_per_complex is not None and bucket_balance:
+        print(f"Using WeightedPerComplexSampler with samples_per_complex={samples_per_complex}, complexes_per_batch={batch_size}")
         sampler = WeightedPerComplexSampler(
             dataset,
             samples_per_complex=samples_per_complex,
@@ -265,7 +245,8 @@ def get_dataloader(manifest_csv: str,
                           collate_fn=pad_collate_fn)
 
     # Case 2: uniform per complex
-    if samples_per_complex is not None:
+    if samples_per_complex is not None and bucket_balance is False:
+        print(f"Using PerComplexSampler with samples_per_complex={samples_per_complex}, complexes_per_batch={batch_size}")
         sampler = WeightedPerComplexSampler(
             dataset,
             samples_per_complex=samples_per_complex,
@@ -276,13 +257,13 @@ def get_dataloader(manifest_csv: str,
         )
         return DataLoader(dataset,
                           batch_sampler=sampler,
-                          sampler=sampler,
                           num_workers=num_workers,
                           pin_memory=True,
                           collate_fn=pad_collate_fn)
 
     # Case 3: bucket‐balance globally
     if bucket_balance:
+        print(f"Using WeightedRandomSampler")
         weights = df["weight"].values
         sampler = WeightedRandomSampler(
             weights=weights,
@@ -290,13 +271,13 @@ def get_dataloader(manifest_csv: str,
             replacement=True
         )
         return DataLoader(dataset,
-                          batch_size=batch_size,
-                          sampler=sampler,
+                          batch_sampler=sampler,
                           num_workers=num_workers,
                           pin_memory=True,
                           collate_fn=pad_collate_fn)
 
     # Case 4: plain shuffle
+    print(f"Using plain shuffle")
     return DataLoader(dataset,
                       batch_size=batch_size,
                       shuffle=True,
