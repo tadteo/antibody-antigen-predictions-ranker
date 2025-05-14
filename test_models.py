@@ -51,10 +51,13 @@ def load_model_and_config(model_path, device):
         aggregator=model_cfg['aggregator']
     )
 
+    checkpoint = torch.load(model_path, map_location=device)
+    # If the checkpoint is a dict with 'model_state_dict', use it
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    else:
+        state_dict = checkpoint  # fallback for plain state_dict
 
-    # print(f"Loading weights from: {model_path}")  # Debug print
-    state_dict = torch.load(model_path, map_location=device)
-    # print(f"State dict keys: {state_dict.keys()}")  # Debug print
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
@@ -240,8 +243,9 @@ def main():
     split = 'train' # 'train' or 'test'  
 
     # --- DataLoader ---
+    manifest_file = 'data/manifest_filtered_density_with_clipping.csv'
     test_loader = get_eval_dataloader(
-        'data/manifest_with_ptm_no_normalization.csv',  # your test manifest
+        manifest_file,  # your test manifest
         split=split,
         batch_size=8,
         num_workers=2,
@@ -249,7 +253,7 @@ def main():
     )
 
     # --- Pull complex_ids straight from the manifest (no dataloader change) ---
-    manifest_df = pd.read_csv('data/manifest_with_ptm_no_normalization.csv')
+    manifest_df = pd.read_csv(manifest_file)
     manifest_df = manifest_df[manifest_df['split'] == split].reset_index(drop=True)
     test_cids   = manifest_df['complex_id'].tolist()
 

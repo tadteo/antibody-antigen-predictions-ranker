@@ -9,6 +9,7 @@ data:
   splits_dir: data/raw_splits
   manifest_file: data/manifest_with_ptm_no_normalization.csv
   feature_transform: true
+  feature_centering: true
 
 model:
   input_dim: 3
@@ -19,9 +20,9 @@ model:
 training:
   batch_size: 6 #8 max batch for sum aggregators #6 max batch for concat_stats aggregator #4 max batch for attn_pool aggregator
   num_workers: 4
-  epochs: 50
-  lr: 0.001
-  weight_decay: 0.00001
+  epochs: 100
+  lr: !!float 0.001
+  weight_decay: !!float 0.00001
   smooth_l1_beta: 0.5
   weighted_loss: false
   bucket_balance: true
@@ -29,4 +30,5 @@ training:
   seed: 42
   lr_scheduler_factor: 0.75
   lr_scheduler_patience: 15
-  min_lr: 1e-6
+  min_lr: !!float 1e-6
+  adaptive_weight: true

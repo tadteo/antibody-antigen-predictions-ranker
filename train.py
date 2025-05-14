@@ -32,10 +32,6 @@ def main():
         help='Path to config YAML file'
     )
     parser.add_argument(
-        '--manifest_csv', type=str, required=True,
-        help='Path to manifest CSV file'
-    )
-    parser.add_argument(
         '--output_dir', type=str, required=True,
         help='Directory to save model checkpoints'
     )
@@ -54,12 +50,16 @@ def main():
     wandb.login(key=os.getenv("WANDB_API_KEY"), relogin=True)
     
     # 2) Paths & hyperparams
-    manifest_csv        = args.manifest_csv
+    
+    manifest_csv        = cfg['data']['manifest_file']
+    if manifest_csv is None:
+        raise ValueError("manifest_csv is not set in the config")
+
     batch_size          = cfg['training']['batch_size']
     num_workers         = cfg['training']['num_workers']
 
     # sampling choices
-    samples_per_complex = cfg['num_samples_per_complex']
+    samples_per_complex = cfg['num_samples_per_complex'] if cfg['num_samples_per_complex'] != "None" else None
     bucket_balance      = cfg['training'].get('bucket_balance', False)
 
     # number of epochs should allow to theoretically see al the samples at least once
@@ -70,9 +70,12 @@ def main():
     print(f"Number of lines in manifest: {len(open(manifest_csv).readlines())-1}")
     print(f"Batch size: {batch_size}")
     print(f"Samples per complex: {samples_per_complex}")
-    actual_number_of_epochs = int((len(open(manifest_csv).readlines())-1) / (batch_size * samples_per_complex))
-    print(f"Actual number of epochs: {actual_number_of_epochs}")
-    epochs              = cfg['training']['epochs'] * actual_number_of_epochs
+    if samples_per_complex is not None:
+        actual_number_of_epochs = int((len(open(manifest_csv).readlines())-1) / (batch_size * samples_per_complex))
+        print(f"Actual number of epochs: {actual_number_of_epochs}")
+        epochs              = cfg['training']['epochs'] * actual_number_of_epochs
+    else:
+        epochs = cfg['training']['epochs']
     
     print(f"Number of epochs: {epochs}")
 
@@ -82,8 +85,16 @@ def main():
     weighted_loss       = cfg['training'].get('weighted_loss', False)
 
     feature_transform   = cfg['data']['feature_transform']
+    feature_centering   = cfg['data'].get('feature_centering', False)
     print(f"Feature transform: {feature_transform}")
-
+    print(f"Feature centering: {feature_centering}")
+    
+    # adaptive weight: focus more on extreme targets (DockQ near 0 or 1)
+    adaptive_weight = cfg['training'].get('adaptive_weight', False)
+    if adaptive_weight:
+        print("Using adaptive weight")
+    else:
+        print("Not using adaptive weight")
 
     # 3) DataLoaders
     #    - train: with our chosen sampler
@@ -95,6 +106,7 @@ def main():
         samples_per_complex=samples_per_complex,
         bucket_balance=bucket_balance,
         feature_transform=feature_transform,
+        feature_centering=feature_centering,
         seed=seed
     )
     #    - val: sequential, no special sampling
@@ -104,10 +116,11 @@ def main():
         batch_size=batch_size,
         num_workers=num_workers,
         feature_transform=feature_transform,
+        feature_centering=feature_centering,
         seed=seed
     )
 
-    # 4) Model, device, optimizer
+    # Model, device, optimizer
     input_dim        = cfg['model']['input_dim']
     phi_hidden_dims  = cfg['model']['phi_hidden_dims']
     rho_hidden_dims  = cfg['model']['rho_hidden_dims']
@@ -154,10 +167,11 @@ def main():
     #phi_hidden_dims and rho_hiddens_dims to string
     phi_hidden_dims_str = '_'.join(str(dim) for dim in phi_hidden_dims)
     rho_hidden_dims_str = '_'.join(str(dim) for dim in rho_hidden_dims)
-    name = f"DeepSet_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_logit_transform_encode_features_{feature_transform}_phi_hidden_dims_{phi_hidden_dims_str}_rho_hidden_dims_{rho_hidden_dims_str}_seed_{seed}_samples_per_complex_{samples_per_complex}_aggregator_{aggregator}_lr_scheduler_{learning_rate_scheduler_str}"
+    name = f"DeepSet_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_weighted_loss_{weighted_loss}_feature_transform_{feature_transform}_phi_hidden_dims_{phi_hidden_dims_str}_rho_hidden_dims_{rho_hidden_dims_str}_seed_{seed}_samples_per_complex_{samples_per_complex}_aggregator_{aggregator}_lr_scheduler_{learning_rate_scheduler_str}"
 
     # Initialize W&B run
     wandb.init(
+        entity=os.getenv("WANDB_ENTITY"),
         project=os.getenv("WANDB_PROJECT"), 
         config=cfg,
         name=name
@@ -174,15 +188,25 @@ def main():
     with open(os.path.join(ckpt_output_dir, 'config.yaml'), 'w') as f:
         yaml.dump(cfg, f)
     
+    #clean up memory
+    torch.cuda.empty_cache()
+
     #before training, run a forward pass with the biggest complex in the train set
     #to check if the model does not throw a memory error
+    biggest_batch = None
     for batch in train_loader:
-        feats  = batch['features'].to(device)
-        lengths = batch['lengths'].to(device)
-        labels = batch['label'].to(device)
-        weights= batch['weight'].to(device)
-        _ = model(feats, lengths)
-
+        #find the batch with the biggest complex
+        if biggest_batch is None or batch['lengths'].max() > biggest_batch['lengths'].max():
+            biggest_batch = batch
+    feats  = biggest_batch['features'].to(device)
+    lengths = biggest_batch['lengths'].to(device)
+    labels = biggest_batch['label'].to(device)
+    weights= biggest_batch['weight'].to(device)
+    _ = model(feats, lengths)
+    
+    #clean up memory
+    torch.cuda.empty_cache()
+    
     # --- resume logic: load checkpoint if requested and bump start_epoch ---
     start_epoch = 1
     if args.resume is not None:
@@ -197,156 +221,107 @@ def main():
             # assume it's just a plain model.state_dict()
             model.load_state_dict(checkpoint)
             print("Loaded model weights only; optimizer state not found, starting at epoch 1")
-            start_epoch = 1820
-
+    
     # Training loop
+    print(f"Starting training from epoch {start_epoch}")
+    
+    #Setup variables useful for logging
+    #We define a step as a batch (a gradient step)
+    log_interval = 150
+    log_interval_counter = 0
+    running_loss = 0.0
+    running_grad_norm = 0.0
+    num_batches = 0
+    last_log_time = time.time()
+    running_avg_dockq = 0.0
+    
     for epoch in range(start_epoch, epochs + 1):
         model.train()
-        # ── track training time & grad norms ───────────────────────────────────
-        epoch_start    = time.time()
-        total_grad_norm = 0.0
-        num_batches     = 0
-        running_loss = 0.0
-        num_samples  = 0
+        epoch_start = time.time()
+        
+        avg_val_loss_per_epoch = 0.0
+        log_step_per_epoch = 0
+        avg_loss = 0.0  # Initialize avg_loss here
+        abs_errors = np.array([0.0])  # Initialize abs_errors here
 
-        #average_dockq_per_epoch
-        dockq_per_epoch = []
-
-        # ---- TRAINING ----
         for batch in train_loader:
-            # unpack the dict that our Dataset returns
-            feats  = batch['features'].to(device)  # [B, 4]
-            lengths = batch['lengths'].to(device)  # [B]
-            labels = batch['label'].to(device)     # [B]
-            weights= batch['weight'].to(device)    # [B]
+            loss, grad_norm, batch_size, avg_dockq = train_step(
+                model, batch, optimizer, base_criterion, device, weighted_loss, adaptive_weight
+            )
 
-            #debug dataloader
-            # print(feats.shape)
-            # print(labels.shape)
-            # print(weights.shape)
+            running_loss += loss
+            running_grad_norm += grad_norm
+            log_interval_counter += 1
+            running_avg_dockq += avg_dockq
+            # Log every log_interval steps
+            if log_interval_counter % log_interval == 0:
+                avg_loss = running_loss / log_interval_counter
+                avg_grad_norm = running_grad_norm / log_interval_counter
+                avg_dockq = running_avg_dockq / log_interval
+                elapsed = time.time() - last_log_time
+                throughput = log_interval / elapsed if elapsed > 0 else 0.0
+                
+                #log training metrics to W&B
+                wandb.log({
+                    "train/loss": avg_loss,
+                    "train/grad_norm": avg_grad_norm,
+                    "train/lr": optimizer.param_groups[0]['lr'],
+                    "train/throughput": throughput,
+                    "train/epoch": epoch,
+                    "train/avg_dockq": avg_dockq,
+                }, step=log_interval_counter)
+
+                # Reset running stats for next interval
+                running_loss = 0.0
+                running_grad_norm = 0.0
+                running_avg_dockq = 0.0
+                throughput = 0.0
+                last_log_time = time.time()
+
+                #run validation as part of the logging
+
+                # ---- VALIDATION ----
+                val_loss, val_preds, val_labels = run_validation(
+                    model, val_loader, base_criterion, device, weighted_loss
+                )
+
+                # Check the difference between the predicted and true labels
+                errors = val_preds - val_labels
+                abs_errors = np.abs(errors)
+
+                # Log validation metrics to W&B
+                wandb.log({
+                    "val/loss":         val_loss,
+                    "val/abs_error":    abs_errors,
+
+                    # new distribution metrics:
+                    "val/error_histogram":      wandb.Histogram(errors, num_bins=512),
+                    "val/abs_error_histogram":  wandb.Histogram(abs_errors, num_bins=512),
+                    "val/abs_error_mean":       abs_errors.mean(),
+
+                    # optionally, some quantiles for quick reference:
+                    "val/abs_error_q10": np.percentile(abs_errors, 10),
+                    "val/abs_error_q50": np.percentile(abs_errors, 50),
+                    "val/abs_error_q90": np.percentile(abs_errors, 90),
+                }, step=log_interval_counter)
+
+                avg_val_loss_per_epoch += val_loss
+                log_step_per_epoch += 1
+                
+                print(f"Epoch {epoch}/{epochs} step {log_interval_counter}/{len(train_loader)} — Train loss: {avg_loss:.8f}")
+                
+                # Update learning rate
+                learning_rate_scheduler.step(val_loss)
+                #after validation bring the model back to training mode
+                model.train()
         
-            dockq_per_epoch.append(labels.cpu().numpy())
+        avg_val_loss = avg_val_loss_per_epoch / max(log_step_per_epoch, 1)
+        print(f"Epoch {epoch}/{epochs}, Elapsed time: {time.time() - epoch_start:.2f}s, Train loss: {avg_loss:.8f} —  Val loss: {avg_val_loss:.8f} —  Val abs error mean: {abs_errors.mean():.8f}")
 
-
-            #tranform labels via a clipped logit function
-            epsilon = 1e-6
-            labels = torch.clamp(labels, min=epsilon, max=1-epsilon)
-            labels = torch.log(labels / (1-labels))
-
-            # zero the parameter gradients
-            optimizer.zero_grad()
-            logits = model(feats, lengths)                  # [B]
-
-            # per-sample Huber (Smooth L1), then weight, then average
-            # logits: [B], labels: [B], weights: [B]
-            if weighted_loss:
-                losses = base_criterion(logits, labels)
-                loss   = (losses * weights).mean()
-            else:
-                loss   = base_criterion(logits, labels).mean()
-
-            loss.backward()
-            # accumulate gradient‐norm for this batch
-            sq = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    sq += p.grad.data.norm(2).item() ** 2
-            total_grad_norm += sq ** 0.5
-            num_batches     += 1
-            optimizer.step()
-
-            running_loss += loss.item() * feats.size(0)
-            num_samples  += feats.size(0)
-
-        average_dockq_per_epoch = np.mean(dockq_per_epoch)
-
-        train_loss = running_loss / num_samples
-        # compute average grad‐norm & throughput for the epoch
-        avg_grad_norm = total_grad_norm / num_batches if num_batches else 0.0
-        elapsed       = time.time() - epoch_start
-        throughput    = num_samples / elapsed if elapsed > 0 else 0.0
-
-        # ---- VALIDATION ----
-        model.eval()
-        val_preds  = []
-        val_labels = []
-        val_loss   = 0.0
-        val_count  = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                feats  = batch['features'].to(device)
-                lengths = batch['lengths'].to(device)
-                labels = batch['label'].to(device)
-                weights= batch['weight'].to(device)  # still available
-
-                #tranform labels via a clipped logit function
-                epsilon = 1e-6
-                labels = torch.clamp(labels, min=epsilon, max=1-epsilon)
-                labels = torch.log(labels / (1-labels))
-
-                logits = model(feats, lengths)
-                losses = base_criterion(logits, labels)
-                # per-sample Huber (Smooth L1), then weight, then average
-                # logits: [B], labels: [B], weights: [B]
-                if weighted_loss:
-                    loss   = (losses * weights).mean()
-                else:
-                    loss   = losses.mean()
-
-                val_loss += loss.item() * feats.size(0)
-                val_count+= feats.size(0)
-                # collect predictions & true labels
-                #convert back labels and logits to 0 1
-                labels = torch.sigmoid(labels)
-                logits = torch.sigmoid(logits)
-
-                val_preds.append(logits.cpu().numpy())
-                val_labels.append(labels.cpu().numpy())
-
-        val_loss /= val_count
-
-        print(f"Epoch {epoch}/{epochs} —  Train loss: {train_loss:.8f} —  Val loss: {val_loss:.8f}")
         
-        # average DockQ on val set
-        val_preds  = np.concatenate(val_preds) #
-        val_labels = np.concatenate(val_labels)
-        # Check the difference between the predicted and true labels
-
-
-        errors = val_preds - val_labels
-        abs_errors = np.abs(errors)
-        
-        #squeeze all errors above 10 nad below -10 to 10
-        errors = np.clip(errors, -10, 10)
-        abs_errors = np.clip(abs_errors, -10, 10)
-
-        # 6.a) Log metrics to W&B
-        wandb.log({
-            "train/loss":       train_loss,
-            "train/grad_norm":  avg_grad_norm,
-            "train/lr":         optimizer.param_groups[0]['lr'],
-            "train/throughput": throughput,
-            "train/average_dockq": average_dockq_per_epoch,
-
-            "val/loss":         val_loss,
-            "val/abs_error":    abs_errors,
-
-            # new distribution metrics:
-            "val/error_histogram":      wandb.Histogram(errors, num_bins=512),
-            "val/abs_error_histogram":  wandb.Histogram(abs_errors, num_bins=512),
-            "val/abs_error_mean":       abs_errors.mean(),
-
-            # optionally, some quantiles for quick reference:
-            "val/abs_error_q10": np.percentile(abs_errors, 10),
-            "val/abs_error_q50": np.percentile(abs_errors, 50),
-            "val/abs_error_q90": np.percentile(abs_errors, 90),
-        }, step=epoch)
-
-        # Update learning rate
-        learning_rate_scheduler.step(val_loss)
 
         # 7) Save checkpoint
-        if epoch % 20 == 0:
+        if epoch % 5 == 0:
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -354,6 +329,91 @@ def main():
             }, os.path.join(ckpt_output_dir, f"checkpoint_epoch{epoch}.pt"))
 
     print("Training complete.")
+
+def run_validation(model, val_loader, base_criterion, device, weighted_loss):
+    model.eval()
+    val_preds  = []
+    val_labels = []
+    val_loss   = 0.0
+    val_count  = 0
+    with torch.no_grad():
+        for batch in val_loader:
+            feats  = batch['features'].to(device)
+            lengths = batch['lengths'].to(device)
+            labels = batch['label'].to(device)
+            weights= batch['weight'].to(device)  # still available
+
+            # transform labels via a clipped logit function
+            epsilon = 1e-6
+            labels = torch.clamp(labels, min=epsilon, max=1-epsilon)
+            labels = torch.log(labels / (1-labels))
+
+            logits = model(feats, lengths)
+            losses = base_criterion(logits, labels)
+            if weighted_loss:
+                loss = (losses * weights).mean()
+            else:
+                loss = losses.mean()
+
+            val_loss += loss.item()
+            val_count += feats.size(0)
+
+            # convert back labels and logits to 0-1
+            labels = torch.sigmoid(labels)
+            logits = torch.sigmoid(logits)
+
+            val_preds.append(logits.cpu().numpy())
+            val_labels.append(labels.cpu().numpy())
+
+    val_loss /= val_count
+    val_preds = np.concatenate(val_preds)
+    val_labels = np.concatenate(val_labels)
+    return val_loss, val_preds, val_labels
+
+def train_step(model, batch, optimizer, base_criterion, device, weighted_loss, adaptive_weight):
+    feats  = batch['features'].to(device)
+    lengths = batch['lengths'].to(device)
+    labels = batch['label'].to(device)
+    weights= batch['weight'].to(device)
+    
+
+    avg_dockq = labels.mean().item()
+    # Transform labels via a clipped logit function
+    epsilon = 1e-6
+    labels = torch.clamp(labels, min=epsilon, max=1-epsilon)
+    labels = torch.log(labels / (1-labels))
+
+    optimizer.zero_grad()
+    logits = model(feats, lengths)
+    losses = base_criterion(logits, labels)
+
+    if adaptive_weight:
+        # Compute adaptive weight: focus more on extreme targets (DockQ near 0 or 1)
+        with torch.no_grad():
+            # Compute confidence weight: focus more on extreme targets (DockQ near 0 or 1 do this per label)
+            confidence_weight = 1.0 + 4.0 * ((labels < 0.1) | (labels > 0.9))
+            # print(f"Confidence weight: {confidence_weight}")
+            # print(f"Labels: {labels}")
+        
+        # apply confidence weight to weights
+        weights = weights * confidence_weight
+
+    if weighted_loss:
+        loss   = (losses * weights).mean()
+    else:
+        loss   = losses.mean()
+
+    loss.backward()
+    optimizer.step()
+
+    # Compute grad norm
+    grad_norm = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            grad_norm += p.grad.data.norm(2).item() ** 2
+    grad_norm = grad_norm ** 0.5
+
+    return loss.item(), grad_norm, feats.size(0), avg_dockq
 
 if __name__ == '__main__':
     main()

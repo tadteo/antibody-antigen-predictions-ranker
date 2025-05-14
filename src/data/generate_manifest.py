@@ -26,11 +26,11 @@ from sklearn.model_selection import train_test_split
 import yaml
 
 # Global DockQ bin edges
-BIN_EDGES = [0.0, 0.25, 0.50, 0.75, 1.00]
+BIN_EDGES = [0.0, 0.115, 0.23, 0.36, 0.49, 0.64, 0.79, 0.895, 1.00]
 NUM_BUCKETS = len(BIN_EDGES) - 1
 
 
-def build_manifest(h5_dir, val_frac, test_frac, seed, out_csv, config):
+def build_manifest(h5_dir, val_frac, test_frac, seed, out_csv, weight_strategy):
     rows = []
     num_complexes = 0
     # 1. iterate complexes
@@ -48,12 +48,14 @@ def build_manifest(h5_dir, val_frac, test_frac, seed, out_csv, config):
                 id = complex_id
                 is_complex_valid = True
                 for sample in hf[complex_id].keys():
+                    if not isinstance(hf[complex_id][sample], h5py.Group):
+                        continue  # skip datasets like pae_col_mean, pae_col_std
                     dockq = float(hf[f"{complex_id}/{sample}/abag_dockq"][()])
                     ptm = float(hf[f"{complex_id}/{sample}/ptm"][()])
                     iptm = float(hf[f"{complex_id}/{sample}/iptm"][()])
                     ranking_confidence = float(hf[f"{complex_id}/{sample}/ranking_confidence"][()])
                     tm_normalized = float(hf[f"{complex_id}/{sample}/tm_normalized_reference"][()])
-                    bucket = np.digitize(dockq, BIN_EDGES, right=False) - 1
+                    
                     # Skip if DockQ is NaN
                     if np.isnan(dockq):
                         is_complex_valid = False
@@ -69,8 +71,6 @@ def build_manifest(h5_dir, val_frac, test_frac, seed, out_csv, config):
                             'iptm': iptm,
                             'ranking_confidence': ranking_confidence,
                             'tm_normalized': tm_normalized,
-                            'bucket': int(bucket),
-                            'weight_bucket': None,
                             'weight': None,
                             'split': None
                         })
@@ -186,50 +186,56 @@ def build_manifest(h5_dir, val_frac, test_frac, seed, out_csv, config):
         print(f"    per‐complex std:  mean={sub_std.mean():.3f}, std={sub_std.std():.3f}")
         print(f"    per‐complex mean: mean={sub_mean.mean():.3f}, std={sub_mean.std():.3f}")
 
+    #--- WEIGHTING ---
 
     # Add the split and weight column to the df
     df['split'] = df['complex_id'].map(split_map)
 
-    #for each split, compute the weight of the complexes
+    # for each split, compute the weight of the complexes
     for split in ['train','val','test']:
-        sub_df = df[df['split']==split]
-        
-        # compute weight for each bucket    
-        bucket_counts = sub_df['bucket'].value_counts().to_dict()
-        sub_df['weight_bucket'] = sub_df['bucket'].map(lambda b: 1.0 / bucket_counts[b])
+        # make an explicit copy to avoid SettingWithCopyWarning
+        sub_df = df[df['split']==split].copy()
 
-        #divide the weight_bucket by the number of buckets
-        sub_df['weight_bucket'] = sub_df['weight_bucket'] / NUM_BUCKETS
+        if weight_strategy == 'bucket':
+            # original bucket‐based weighting
+            sub_df['bucket'] = np.digitize(sub_df['label'], BIN_EDGES, right=False) - 1  # Create bucket column first
+            bucket_counts = sub_df['bucket'].value_counts().to_dict()
+            sub_df['weight'] = sub_df['bucket'].map(lambda b: 1.0 / bucket_counts[b])
+            sub_df['weight'] = sub_df['weight'] / NUM_BUCKETS
+        elif weight_strategy == 'uniform':
+            # equal weight for every sample
+            sub_df['weight'] = 1.0
+        elif weight_strategy in ('density','density_with_clipping'):
+            hist, edges = np.histogram(sub_df['label'], bins=50, density=True)
+            bin_idx = np.digitize(sub_df['label'], edges) - 1
+            # clamp idx to valid range
+            bin_idx = np.clip(bin_idx, 0, len(hist) - 1)
+            density = hist[bin_idx]
+            sub_df['weight'] = 1.0 / density
+            if weight_strategy == 'density_with_clipping':
+                mean_w = sub_df['weight'].mean()
+                #get the 10th and 90th percentile of the weights
+                q10 = np.percentile(sub_df['weight'], 10)
+                q90 = np.percentile(sub_df['weight'], 90)
+                sub_df['weight'] = np.clip(sub_df['weight'], q10, q90)
 
-        # final weight is product of the two:
-        # df['weight'] = df['weight_complex']
-        sub_df['weight'] = sub_df['weight_bucket']
+        else:
+            raise ValueError(f"Unknown weight strategy: {weight_strategy}")
 
-        #add the weight to the df
-        df.loc[df['split']==split, 'weight_bucket'] = sub_df['weight_bucket']
         df.loc[df['split']==split, 'weight'] = sub_df['weight']
 
-
-    #check for each split that the weight bucket is correct
+    # print some stats about the weights
     for split in ['train','val','test']:
         sub_df = df[df['split']==split]
-        #count the number of elements in each bucket
-        bucket_counts = sub_df['bucket'].value_counts().to_dict()
-        # calculate the weight of each bucket
-        bucket_weights = []
-        for b in bucket_counts:
-            bucket_weights.append(bucket_counts[b]/len(sub_df))
-
-        for bucket in bucket_counts:
-            print(f"The weight bucket for the {split} split is {bucket_weights[bucket]}")
-        print(f"The sum of the weights for the {split} split is {sum(bucket_weights)}")
+        total = sub_df['weight'].sum()
         
-    #check that the sum of the weights is 1 for each split
-    for split in ['train','val','test']:
-        sub_df = df[df['split']==split]
+        print(f"The mean, min and max weights for the {split} split are:\n\tmean:{sub_df['weight'].mean():.8f},\n\tmin:{sub_df['weight'].min():.8f},\n\tmax:{sub_df['weight'].max():.8f}")
         print(f"The sum of the weights for the {split} split is {sub_df['weight'].sum()}")
 
+
     # Write to CSV the manifest for each sample and apply the correct split to each sample
+    # add weight_strategy to csv name
+    out_csv = out_csv.replace('.csv', f'_{weight_strategy}.csv')
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     df.to_csv(out_csv, index=False)
 
@@ -246,16 +252,15 @@ def parse_args():
                    help='Fraction for test split')
     p.add_argument('--seed', type=int, default=42,
                    help='Random seed for reproducibility')
-    p.add_argument('--out_csv', default='data/manifest_with_ptm_no_normalization.csv',
+    p.add_argument('--out_csv', default='data/manifest_filtered_pae_centered.csv',
                    help='Output path for manifest CSV')
-    p.add_argument('--config', type=str, default='configs/config.yaml', help='Path to YAML config file')
+    p.add_argument('--weight_strategy', choices=['bucket','uniform','density','density_with_clipping'], default='density_with_clipping',
+                   help='Strategy for sample weights: bucket or uniform')
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
     if args.val_frac + args.test_frac >= 1.0:
         raise ValueError("val_frac + test_frac must be < 1.0")
     build_manifest(
@@ -264,7 +269,7 @@ def main():
         test_frac=args.test_frac,
         seed=args.seed,
         out_csv=args.out_csv,
-        config=config
+        weight_strategy=args.weight_strategy
     )
 
 

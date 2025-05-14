@@ -59,7 +59,7 @@ class WeightedPerComplexSampler(Sampler):
     def __init__(self,
                  dataset,
                  samples_per_complex: int,
-                 complexes_per_batch: int,
+                 batch_size: int,
                  weighted: bool = True,
                  replacement: bool = True,
                  seed: int = None
@@ -74,8 +74,8 @@ class WeightedPerComplexSampler(Sampler):
         seed: seed for the RNG
         """
         self.df = dataset.df  # the manifest filtered to one split
-        self.M  = samples_per_complex
-        self.complexes_per_batch = complexes_per_batch
+        self.samples_per_complex  = samples_per_complex
+        self.batch_size = batch_size
         self.weighted = weighted
         self.replacement = replacement
         self.rng = np.random.RandomState(seed)
@@ -87,11 +87,21 @@ class WeightedPerComplexSampler(Sampler):
         # Get the indices to sample from
         indices = np.arange(len(self.df))
         # Sample from indices using the weights
-        if self.weighted:
-            sampled_indices = self.rng.choice(indices, size=(self.M*self.complexes_per_batch), replace=False, p=self.df["weight"].values)
+
+        if self.samples_per_complex is None:
+            #act as weighted random sampler
+            if self.weighted:
+                #normalize weights so they sum exactly to 1
+                self.df["weight"] = self.df["weight"] / self.df["weight"].sum()
+                
+                sampled_indices = self.rng.choice(indices, size=len(indices), replace=False, p=self.df["weight"].values)
+            else:
+                sampled_indices = self.rng.choice(indices, size=len(indices), replace=False)
         else:
-            sampled_indices = self.rng.choice(indices, size=(self.M*self.complexes_per_batch), replace=False)
-        
+            if self.weighted:
+                sampled_indices = self.rng.choice(indices, size=(self.samples_per_complex*self.batch_size), replace=False, p=self.df["weight"].values)
+            else:
+                sampled_indices = self.rng.choice(indices, size=(self.samples_per_complex*self.batch_size), replace=False)
 
         # Get the samples and their lengths
         samples = self.df.iloc[sampled_indices]
@@ -99,16 +109,22 @@ class WeightedPerComplexSampler(Sampler):
         
         # Create blocks of indices (not DataFrame slices)
         blocks = [
-            sampled_indices[i : i + self.complexes_per_batch]
-            for i in range(0, len(sampled_indices), self.complexes_per_batch)
+            sampled_indices[i : i + self.batch_size]
+            for i in range(0, len(sampled_indices), self.batch_size)
         ]
+        #shuffle the blocks
+        self.rng.shuffle(blocks)
         # Yield integer indices, not DataFrame slices
         for block in blocks:
             yield block.tolist()  # Convert numpy array to list of integers
 
     def __len__(self):
-        # total draws per epoch
-        return len(self.number_of_complexes) * self.M
+        if self.samples_per_complex is None:
+            # If no samples_per_complex specified, return total number of samples
+            return len(self.df)
+        else:
+            # If samples_per_complex specified, return total number of samples per epoch
+            return self.number_of_complexes * self.samples_per_complex
 
 
 # ==============================================================================
@@ -130,11 +146,13 @@ class AntibodyAntigenPAEDataset(Dataset):
     def __init__(self,
                  manifest_csv: str,
                  split: str = "train",
-                 feature_transform=None):
+                 feature_transform=None,
+                 feature_centering=False):
         self.df = pd.read_csv(manifest_csv)
         # Filter to only this split
         self.df = self.df[self.df["split"] == split].reset_index(drop=True)
         self.feature_transform = feature_transform
+        self.feature_centering = feature_centering
 
     def __len__(self):
         return len(self.df)
@@ -152,6 +170,13 @@ class AntibodyAntigenPAEDataset(Dataset):
             interchain_indexes_i = grp["inter_idx"][()]
             interchain_indexes_j = grp["inter_jdx"][()]
 
+            if self.feature_centering:
+                pae_col_mean = hf[complex_id]["pae_col_mean"][()]
+                pae_col_std = hf[complex_id]["pae_col_std"][()]
+
+                interchain_pae_vals = (interchain_pae_vals - pae_col_mean) / (pae_col_std + 1e-6)
+
+
         # Create a 3xn with the interchain indexes and the interchain pae values
         feats = np.array([
             interchain_pae_vals,
@@ -163,6 +188,7 @@ class AntibodyAntigenPAEDataset(Dataset):
         if self.feature_transform:
             # print("Applying feature transform")
             feats = self.feature_transform(feats)
+
 
         #print first 10 features or indexes
         # print(feats[:10])
@@ -184,15 +210,16 @@ def get_eval_dataloader(manifest_csv: str,
                         batch_size: int = 32,
                         num_workers: int = 4,
                         feature_transform: bool = False,
+                        feature_centering: bool = False,
                         seed: int = None):
     """
     DataLoader for evaluation: sequential (no shuffle), no special sampling.
     """
     if feature_transform:
         print("Using triangular positional encoding")
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering)
     else:
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering)
     return DataLoader(dataset,
                       batch_size=batch_size,
                       shuffle=False,
@@ -211,6 +238,7 @@ def get_dataloader(manifest_csv: str,
                    samples_per_complex: int = None,
                    bucket_balance: bool = False,
                    feature_transform: bool = False,
+                   feature_centering: bool = False,
                    seed: int = None):
     """
     Priority of sampling strategies:
@@ -221,19 +249,18 @@ def get_dataloader(manifest_csv: str,
     """
     if feature_transform:
         print("Using triangular positional encoding")
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering)
     else:
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split)
-    df      = dataset.df
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering)
 
     
     # Case 1: both constraints
     if samples_per_complex is not None and bucket_balance:
-        print(f"Using WeightedPerComplexSampler with samples_per_complex={samples_per_complex}, complexes_per_batch={batch_size}")
+        print(f"Using WeightedPerComplexSampler with samples_per_complex={samples_per_complex}, batch_size={batch_size}")
         sampler = WeightedPerComplexSampler(
             dataset,
             samples_per_complex=samples_per_complex,
-            complexes_per_batch=batch_size,
+            batch_size=batch_size,
             weighted=True,
             replacement=True,
             seed=seed
@@ -246,11 +273,11 @@ def get_dataloader(manifest_csv: str,
 
     # Case 2: uniform per complex
     if samples_per_complex is not None and bucket_balance is False:
-        print(f"Using PerComplexSampler with samples_per_complex={samples_per_complex}, complexes_per_batch={batch_size}")
+        print(f"Using PerComplexSampler with samples_per_complex={samples_per_complex}, batch_size={batch_size}")
         sampler = WeightedPerComplexSampler(
             dataset,
             samples_per_complex=samples_per_complex,
-            complexes_per_batch=batch_size,
+            batch_size=batch_size,
             weighted=False,
             replacement=True,
             seed=seed
@@ -261,14 +288,15 @@ def get_dataloader(manifest_csv: str,
                           pin_memory=True,
                           collate_fn=pad_collate_fn)
 
-    # Case 3: bucket‐balance globally
-    if bucket_balance:
-        print(f"Using WeightedRandomSampler")
-        weights = df["weight"].values
-        sampler = WeightedRandomSampler(
-            weights=weights,
-            num_samples=len(weights),
-            replacement=True
+    if samples_per_complex is None:
+        print(f"Using WeightedRandomSampler with block length {batch_size}")
+        sampler = WeightedPerComplexSampler(
+            dataset,
+            samples_per_complex=samples_per_complex,
+            batch_size=batch_size,
+            weighted=False,
+            replacement=True,
+            seed=seed
         )
         return DataLoader(dataset,
                           batch_sampler=sampler,
@@ -276,12 +304,4 @@ def get_dataloader(manifest_csv: str,
                           pin_memory=True,
                           collate_fn=pad_collate_fn)
 
-    # Case 4: plain shuffle
-    print(f"Using plain shuffle")
-    return DataLoader(dataset,
-                      batch_size=batch_size,
-                      shuffle=True,
-                      num_workers=num_workers,
-                      pin_memory=True,
-                      collate_fn=pad_collate_fn)
 

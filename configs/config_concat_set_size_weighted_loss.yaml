@@ -1,4 +1,3 @@
-# Default configuration for project
 
 num_samples_per_complex: None # Number of samples per complex used in each epoch
 
@@ -13,12 +12,12 @@ data:
 
 model:
   input_dim: 3
-  aggregator: attn_pool
+  aggregator: concat_stats_by_set_size
   phi_hidden_dims: [128, 128, 128]
   rho_hidden_dims: [128, 128, 128]
 
 training:
-  batch_size: 3 #8 max batch for sum aggregators #6 max batch for concat_stats aggregator #4 max batch for attn_pool aggregator
+  batch_size: 4 #8 max batch for sum aggregators #6 max batch for concat_stats aggregator #4 max batch for attn_pool aggregator
   num_workers: 4
   epochs: 100
   lr: !!float 1e-3

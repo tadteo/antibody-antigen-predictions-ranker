@@ -9,6 +9,7 @@ data:
   splits_dir: data/raw_splits
   manifest_file: data/manifest_with_ptm_no_normalization.csv
   feature_transform: true
+  feature_centering: true
 
 model:
   input_dim: 3
