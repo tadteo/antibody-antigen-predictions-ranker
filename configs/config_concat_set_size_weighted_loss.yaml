@@ -1,24 +1,26 @@
 
-num_samples_per_complex: None # Number of samples per complex used in each epoch
+
 
 data:
   raw_dir: data/raw
   processed_dir: data/processed
   processed_file: processed_data.h5
   splits_dir: data/raw_splits
-  manifest_file: data/manifest_filtered_pae_centered_density_with_clipping.csv
+  manifest_file: data/manifest_filtered_pae_centered_density_with_clipping_500k_maxlen.csv
   feature_transform: true
   feature_centering: true
+  batch_size: 2 #8 max batch for sum aggregators #6 max batch for concat_stats aggregator #4 max batch for attn_pool aggregator
+  num_workers: 4
+  samples_per_complex: 3
 
 model:
-  input_dim: 3
+  input_dim: 4
   aggregator: concat_stats_by_set_size
   phi_hidden_dims: [128, 128, 128]
   rho_hidden_dims: [128, 128, 128]
 
 training:
-  batch_size: 4 #8 max batch for sum aggregators #6 max batch for concat_stats aggregator #4 max batch for attn_pool aggregator
-  num_workers: 4
+  adaptive_weight: true
   epochs: 100
   lr: !!float 1e-3
   weight_decay: !!float 1e-5
@@ -27,7 +29,12 @@ training:
   bucket_balance: false
   num_buckets: 4
   seed: 42
+  lr_scheduler_type: "OneCycleLR"  # or "ReduceLROnPlateau"
   lr_scheduler_factor: 0.75
-  lr_scheduler_patience: 15
-  min_lr: !!float 2e-5
-  adaptive_weight: true
+  lr_scheduler_patience: 5
+  min_lr: !!float 1e-6
+  onecycle_max_lr: 0.01         # Only used if lr_scheduler_type is OneCycleLR
+  onecycle_pct_start: 0.3       # Only used if lr_scheduler_type is OneCycleLR
+  onecycle_div_factor: 10.0     # Only used if lr_scheduler_type is OneCycleLR
+  onecycle_final_div_factor: !!float 100 # Only used if lr_scheduler_type is OneCycleLR
+

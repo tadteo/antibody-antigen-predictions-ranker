@@ -15,7 +15,7 @@ Usage:
     3. Adjust the model and dataloader configuration in the script as needed (input_dim, hidden dims, etc).
 
     4. Run the script:
-        python src/test_models.py
+        python test_models.py --config configs/config.yaml
 
     5. Results:
         - MSE for each model is printed to the console.
@@ -34,18 +34,21 @@ from src.models.deep_set import DeepSet
 from src.data.dataloader import get_eval_dataloader  # or your test loader
 import yaml
 import pandas as pd
+import argparse
+from omegaconf import OmegaConf
 
 def load_model_and_config(model_path, device):
     model_dir = os.path.dirname(model_path)
     config_path = os.path.join(model_dir, 'config.yaml')
     # print(f"Loading config from: {config_path}")  # Debug print
     with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
+        config = OmegaConf.load(config_path)
     model_cfg = config['model']
     # print(f"Model config: {model_cfg}")  # Debug print
     
     model = DeepSet(
         input_dim=model_cfg['input_dim'],
+        output_dim=model_cfg['output_dim'],
         phi_hidden_dims=model_cfg['phi_hidden_dims'],
         rho_hidden_dims=model_cfg['rho_hidden_dims'],
         aggregator=model_cfg['aggregator']
@@ -65,7 +68,7 @@ def load_model_and_config(model_path, device):
     return model
 
 def evaluate_model(model, dataloader, device):
-    all_preds, all_labels = [], []
+    all_preds, all_labels, all_complex_ids = [], [], []
     with torch.no_grad():
         for batch in dataloader:
             feats = batch['features'].to(device)
@@ -73,14 +76,21 @@ def evaluate_model(model, dataloader, device):
             labels = batch['label'].to(device)
             
             preds = model(feats, lengths)
-            #convert back logits to 0 1
+            # convert back logits to 0-1 range
             preds = torch.sigmoid(preds)
+            # also convert labels from logits to 0-1 range
+            labels = torch.sigmoid(labels)
+            
             all_preds.append(preds.cpu().numpy())
             all_labels.append(labels.cpu().numpy())
+            
+            # If 'complex_id' is in the batch, add it to the list
+            if 'complex_id' in batch:
+                all_complex_ids.extend(batch['complex_id'])
     
-    flat_preds  = np.concatenate(all_preds)
+    flat_preds = np.concatenate(all_preds)
     flat_labels = np.concatenate(all_labels)
-    return flat_preds, flat_labels
+    return flat_preds, flat_labels, all_complex_ids
 
 def get_model_info_from_path(model_path):
     # Extract the folder name that contains model details
@@ -156,10 +166,54 @@ def plot_results(preds, labels, model_name, model_info, output_dir, split):
 
 def plot_results_by_complex(preds, labels, complex_ids, model_name, model_info, output_dir, split):
     """Scatter plot of preds vs labels, colored by complex_id."""
-    # create a numeric mapping for each unique complex_id
+    # Make sure all arrays are flattened
+    preds = np.array(preds).flatten()
+    labels = np.array(labels).flatten()
+    
+    # If complex_ids is empty or None, generate dummy IDs
+    if not complex_ids:
+        print("No complex IDs provided, generating dummy IDs...")
+        complex_ids = [f"complex_{i}" for i in range(len(preds))]
+        
+    # If number of complex IDs doesn't match predictions, repeat them to match
+    if len(complex_ids) != len(preds):
+        print(f"Warning: Number of complex IDs ({len(complex_ids)}) doesn't match number of predictions ({len(preds)})")
+        print("This might be due to multiple predictions per complex.")
+        
+        # Option 1: Repeat complex IDs to match predictions (if predictions are ordered by complex)
+        # Calculate how many predictions per complex on average
+        if len(preds) > len(complex_ids):
+            repeat_factor = len(preds) // len(complex_ids)
+            remainder = len(preds) % len(complex_ids)
+            
+            # Repeat each complex ID repeat_factor times
+            repeated_cids = []
+            for cid in complex_ids:
+                repeated_cids.extend([cid] * repeat_factor)
+            
+            # Add remainder elements if needed
+            if remainder > 0:
+                repeated_cids.extend([complex_ids[0]] * remainder)
+            
+            complex_ids = repeated_cids[:len(preds)]  # Truncate to match exactly
+            print(f"Expanded complex IDs by repeating them ({repeat_factor} times each)")
+        # If more complex IDs than predictions, truncate
+        else:
+            complex_ids = complex_ids[:len(preds)]
+            print("Truncated complex IDs to match predictions")
+    
+    # Create a numeric mapping for each unique complex_id
     unique_cids = list(dict.fromkeys(complex_ids))
     cid2idx = {cid:i for i,cid in enumerate(unique_cids)}
-    colors = [cid2idx[c] for c in complex_ids]
+    colors = np.array([cid2idx[c] for c in complex_ids])
+    
+    # Ensure all arrays have the same length for the final plot
+    min_len = min(len(preds), len(labels), len(colors))
+    preds = preds[:min_len]
+    labels = labels[:min_len]
+    colors = colors[:min_len]
+    
+    print(f"Final array shapes - preds: {preds.shape}, labels: {labels.shape}, colors: {colors.shape}")
 
     safe_info = model_info[:100]
     fn = f"{model_name}_{safe_info}_by_complex_{split}.png"
@@ -234,28 +288,53 @@ def plot_all_results(all_preds_labels, all_model_names, all_model_infos, output_
     plt.close()
 
 def main():
-    # --- Config ---
-    model_list_file = 'configs/models_to_test.txt'  # or scan a directory
-    output_dir = 'test_reports'
+    # --- Setup argument parsing ---
+    parser = argparse.ArgumentParser(
+        description="Test DeepSet models and generate evaluation plots"
+    )
+    parser.add_argument(
+        '--model_list', type=str, default=None,
+        help='Path to file listing models to test. Overrides config if specified.'
+    )
+    parser.add_argument(
+        '--output_dir', type=str, default=None,
+        help='Directory to save evaluation plots. Overrides config if specified.'
+    )
+    
+    # Parse known arguments (config path, model_list, output_dir)
+    # and collect unknown arguments for OmegaConf to parse as overrides
+    args, unknown_cli_args = parser.parse_known_args()
+
+    # Load base config from YAML
+    OmegaConf.register_new_resolver("add", lambda x, y: x + y)
+
+
+    # Merge CLI-provided parameters into the config
+    cli_provided_params = {}
+    if args.model_list is not None:
+        cli_provided_params['model_list'] = args.model_list
+    else:
+        model_list_file = 'configs/models_to_test.txt'
+    if args.output_dir is not None:
+        cli_provided_params['output_dir'] = args.output_dir
+    else:
+        output_dir = 'test_reports'
+    
+    if cli_provided_params:
+        cfg = OmegaConf.merge(cfg, OmegaConf.create(cli_provided_params))
+
+    # Parse and merge remaining command line arguments as OmegaConf overrides
+    if unknown_cli_args:
+        try:
+            override_conf = OmegaConf.from_cli(unknown_cli_args)
+            cfg = OmegaConf.merge(cfg, override_conf)
+        except Exception as e:
+            print(f"Warning: Could not parse all CLI overrides with OmegaConf: {e}")
+            print(f"Ensure overrides are in 'key=value' format (e.g., data.manifest_file=path/to/manifest). Unknown args received: {unknown_cli_args}")
+
+    # --- Process config values ---
     os.makedirs(output_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    split = 'train' # 'train' or 'test'  
-
-    # --- DataLoader ---
-    manifest_file = 'data/manifest_filtered_density_with_clipping.csv'
-    test_loader = get_eval_dataloader(
-        manifest_file,  # your test manifest
-        split=split,
-        batch_size=8,
-        num_workers=2,
-        feature_transform=True
-    )
-
-    # --- Pull complex_ids straight from the manifest (no dataloader change) ---
-    manifest_df = pd.read_csv(manifest_file)
-    manifest_df = manifest_df[manifest_df['split'] == split].reset_index(drop=True)
-    test_cids   = manifest_df['complex_id'].tolist()
 
     # --- Load model paths ---
     with open(model_list_file) as f:
@@ -267,34 +346,72 @@ def main():
     all_model_names = []
     all_model_infos = []
 
-    for model_path in model_paths:
-        base_name = os.path.basename(model_path).replace('.pt', '')
-        model_info = get_model_info_from_path(model_path)
-        name_count[base_name] = name_count.get(base_name, 0) + 1
-        if name_count[base_name] > 1:
-            model_name = f"{base_name}_{name_count[base_name]:02d}"
-        else:
-            model_name = base_name
+    for split in ['val', 'test', 'train']:
+        for model_path in model_paths:
+            base_name = os.path.basename(model_path).replace('.pt', '')
+            model_info = get_model_info_from_path(model_path)
+            name_count[base_name] = name_count.get(base_name, 0) + 1
+            if name_count[base_name] > 1:
+                model_name = f"{base_name}_{name_count[base_name]:02d}"
+            else:
+                model_name = base_name
 
-        print(f"Testing model: {model_name} with info: {model_info}")
-        model = load_model_and_config(model_path, device)
-        preds, labels = evaluate_model(model, test_loader, device)
-        cids = test_cids
-        
-        # Add some debugging prints
-        print(f"Predictions stats - Min: {preds.min():.4f}, Max: {preds.max():.4f}, Mean: {preds.mean():.4f}")
-        print(f"Labels stats - Min: {labels.min():.4f}, Max: {labels.max():.4f}, Mean: {labels.mean():.4f}")
-        
-        mse = ((preds - labels) ** 2).mean()
-        print(f"{model_name} - Test MSE: {mse:.4f}")
-        plot_results(preds, labels, model_name, model_info, output_dir, split)
-        plot_results_by_complex(preds, labels, cids, model_name, model_info, output_dir, split)
-        all_preds_labels.append((preds, labels))
-        all_model_names.append(model_name)
-        all_model_infos.append(model_info)
+            # --- DataLoader ---
+            # Get config from model
+            model_dir = os.path.dirname(model_path)
+            config_path = os.path.join(model_dir, 'config.yaml')
 
-    # Plot all models together
-    plot_all_results(all_preds_labels, all_model_names, all_model_infos, output_dir, split)
+            with open(config_path, 'r') as f:
+                model_config = OmegaConf.load(config_path)
+
+            manifest_file = model_config['data']['manifest_file']
+        
+            # --- Pull complex_ids straight from the manifest (no dataloader change) ---
+            manifest_df = pd.read_csv(manifest_file)
+            manifest_df = manifest_df[manifest_df['split'] == split].reset_index(drop=True)
+            test_cids = manifest_df['complex_id'].tolist()
+            
+            # Print diagnostic information about the data
+            print(f"Number of unique complexes in manifest for {split} split: {len(set(test_cids))}")
+            
+            test_loader = get_eval_dataloader(
+                manifest_file,  # your test manifest
+                split=split,
+                batch_size=8,
+                num_workers=2,
+                feature_transform=model_config['data'].get('feature_transform', True),
+                feature_centering=model_config['data'].get('feature_centering', True),
+                number_of_samples_per_feature=model_config['data'].get('number_of_samples_per_feature')
+            )
+
+            print(f"Testing model: {model_name} with info: {model_info}")
+            model = load_model_and_config(model_path, device)
+            preds, labels, model_complex_ids = evaluate_model(model, test_loader, device)
+            
+            # Use the complex IDs from the model if available, otherwise use those from the manifest
+            if model_complex_ids:
+                print(f"Using {len(model_complex_ids)} complex IDs from model evaluation")
+                complex_ids_to_use = model_complex_ids
+            else:
+                print(f"Using {len(test_cids)} complex IDs from manifest")
+                complex_ids_to_use = test_cids
+            
+            print(f"Number of predictions: {len(preds)}, Number of complex IDs: {len(complex_ids_to_use)}")
+            
+            # Add some debugging prints
+            print(f"Predictions stats - Min: {preds.min():.4f}, Max: {preds.max():.4f}, Mean: {preds.mean():.4f}")
+            print(f"Labels stats - Min: {labels.min():.4f}, Max: {labels.max():.4f}, Mean: {labels.mean():.4f}")
+            
+            mse = ((preds - labels) ** 2).mean()
+            print(f"{model_name} - Test MSE: {mse:.4f}")
+            plot_results(preds, labels, model_name, model_info, output_dir, split)
+            plot_results_by_complex(preds, labels, complex_ids_to_use, model_name, model_info, output_dir, split)
+            all_preds_labels.append((preds, labels))
+            all_model_names.append(model_name)
+            all_model_infos.append(model_info)
+
+        # Plot all models together
+        plot_all_results(all_preds_labels, all_model_names, all_model_infos, output_dir, split)
 
 if __name__ == '__main__':
     main()

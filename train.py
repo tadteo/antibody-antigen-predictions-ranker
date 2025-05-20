@@ -17,6 +17,8 @@ from dotenv import load_dotenv
 import time
 import numpy as np
 from datetime import datetime
+from omegaconf import OmegaConf
+
 from src.data.dataloader import (
     get_dataloader,
     get_eval_dataloader
@@ -24,6 +26,7 @@ from src.data.dataloader import (
 from src.models.deep_set import DeepSet, init_weights
 
 def main():
+    # 1) Setup argument parsing
     parser = argparse.ArgumentParser(
         description="Train DeepSet model with per-sample weighting & advanced sampling"
     )
@@ -32,18 +35,42 @@ def main():
         help='Path to config YAML file'
     )
     parser.add_argument(
-        '--output_dir', type=str, required=True,
-        help='Directory to save model checkpoints'
+        '--output_dir', type=str, default=None,
+        help='Directory to save model checkpoints. Overrides config file if specified.'
     )
     parser.add_argument(
         '--resume', type=str, default=None,
-        help='Path to checkpoint file to resume training from'
+        help='Path to checkpoint file to resume training from. Overrides config file if specified.'
     )
-    args = parser.parse_args()
+    
+    # Parse known arguments (config path, output_dir, resume)
+    # and collect unknown arguments for OmegaConf to parse as overrides
+    args, unknown_cli_args = parser.parse_known_args()
 
-    # 1) Load config
-    with open(args.config, 'r') as f:
-        cfg = yaml.safe_load(f)
+    # Load base config from YAML
+    OmegaConf.register_new_resolver("add", lambda x, y: x + y)
+    cfg = OmegaConf.load(args.config)
+
+    # Merge CLI-provided output_dir and resume into the config.
+    # These take precedence over values in the YAML file.
+    cli_provided_params = {}
+    if args.output_dir is not None:
+        cli_provided_params['output_dir'] = args.output_dir
+    if args.resume is not None:
+        cli_provided_params['resume'] = args.resume
+    
+    if cli_provided_params:
+        cfg = OmegaConf.merge(cfg, OmegaConf.create(cli_provided_params))
+
+    # Parse and merge remaining command line arguments as OmegaConf overrides
+    # These should be in key=value format, e.g., training.batch_size=128
+    if unknown_cli_args:
+        try:
+            override_conf = OmegaConf.from_cli(unknown_cli_args)
+            cfg = OmegaConf.merge(cfg, override_conf)
+        except Exception as e:
+            print(f"Warning: Could not parse all CLI overrides with OmegaConf: {e}")
+            print(f"Ensure overrides are in 'key=value' format (e.g., training.lr=0.01). Unknown args received: {unknown_cli_args}")
 
     # 1.a) Initialize W&B run
     load_dotenv()  # will read .env in cwd
@@ -51,16 +78,16 @@ def main():
     
     # 2) Paths & hyperparams
     
-    manifest_csv        = cfg['data']['manifest_file']
+    manifest_csv        = cfg.data.manifest_file
     if manifest_csv is None:
         raise ValueError("manifest_csv is not set in the config")
 
-    batch_size          = cfg['training']['batch_size']
-    num_workers         = cfg['training']['num_workers']
+    batch_size          = cfg.data.batch_size
+    num_workers         = cfg.data.num_workers
 
     # sampling choices
-    samples_per_complex = cfg['num_samples_per_complex'] if cfg['num_samples_per_complex'] != "None" else None
-    bucket_balance      = cfg['training'].get('bucket_balance', False)
+    samples_per_complex = cfg.data.get('samples_per_complex', 1) 
+    bucket_balance      = cfg.training.get('bucket_balance', False)
 
     # number of epochs should allow to theoretically see al the samples at least once
     # so since in each epoch we sample just M samples per complex, then the number of epochs should be
@@ -70,27 +97,22 @@ def main():
     print(f"Number of lines in manifest: {len(open(manifest_csv).readlines())-1}")
     print(f"Batch size: {batch_size}")
     print(f"Samples per complex: {samples_per_complex}")
-    if samples_per_complex is not None:
-        actual_number_of_epochs = int((len(open(manifest_csv).readlines())-1) / (batch_size * samples_per_complex))
-        print(f"Actual number of epochs: {actual_number_of_epochs}")
-        epochs              = cfg['training']['epochs'] * actual_number_of_epochs
-    else:
-        epochs = cfg['training']['epochs']
+    epochs = cfg.training.epochs
     
     print(f"Number of epochs: {epochs}")
 
-    lr                  = cfg['training']['lr']
-    weight_decay        = cfg['training']['weight_decay']
-    seed                = cfg['training'].get('seed', None)
-    weighted_loss       = cfg['training'].get('weighted_loss', False)
+    lr                  = cfg.training.lr
+    weight_decay        = cfg.training.weight_decay
+    seed                = cfg.training.get('seed', None)
+    weighted_loss       = cfg.training.get('weighted_loss', False)
 
-    feature_transform   = cfg['data']['feature_transform']
-    feature_centering   = cfg['data'].get('feature_centering', False)
+    feature_transform   = cfg.data.feature_transform
+    feature_centering   = cfg.data.get('feature_centering', False)
     print(f"Feature transform: {feature_transform}")
     print(f"Feature centering: {feature_centering}")
     
     # adaptive weight: focus more on extreme targets (DockQ near 0 or 1)
-    adaptive_weight = cfg['training'].get('adaptive_weight', False)
+    adaptive_weight = cfg.training.get('adaptive_weight', False)
     if adaptive_weight:
         print("Using adaptive weight")
     else:
@@ -114,6 +136,7 @@ def main():
         manifest_csv,
         split='val',
         batch_size=batch_size,
+        samples_per_complex=samples_per_complex,
         num_workers=num_workers,
         feature_transform=feature_transform,
         feature_centering=feature_centering,
@@ -121,10 +144,10 @@ def main():
     )
 
     # Model, device, optimizer
-    input_dim        = cfg['model']['input_dim']
-    phi_hidden_dims  = cfg['model']['phi_hidden_dims']
-    rho_hidden_dims  = cfg['model']['rho_hidden_dims']
-    aggregator       = cfg['model']['aggregator']
+    input_dim        = cfg.model.input_dim
+    phi_hidden_dims  = cfg.model.phi_hidden_dims
+    rho_hidden_dims  = cfg.model.rho_hidden_dims
+    aggregator       = cfg.model.aggregator
 
     model  = DeepSet(input_dim, phi_hidden_dims, rho_hidden_dims, aggregator=aggregator)
     model.apply(init_weights)
@@ -136,57 +159,84 @@ def main():
 
     # Loss: use weighted Huber (Smooth L1) for robust regression
     # reduction='none' gives you one loss per sample so you can apply your weights
-    base_criterion = nn.SmoothL1Loss(reduction='none', beta=cfg['training']['smooth_l1_beta'])
+    base_criterion = nn.SmoothL1Loss(reduction='none', beta=cfg.training.smooth_l1_beta)
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Ensure output_dir is set, either from config or CLI, before it's used.
+    if not hasattr(cfg, 'output_dir') or cfg.output_dir is None:
+        raise ValueError("output_dir must be specified either in the config file or via --output_dir CLI argument.")
+    os.makedirs(cfg.output_dir, exist_ok=True)
 
     # Replace the summary() call with:
     print(f"\nModel Architecture:")
     print(model)
     print(f"\nNumber of parameters: {sum(p.numel() for p in model.parameters())}")
 
-    # Create a sample input for wandb to trace the model
-    sample_batch_size = 1
-    sample_seq_len = 20
-    sample_input_dim = 3
-    sample_x = torch.zeros((sample_batch_size, sample_seq_len, sample_input_dim), device=device)
-    sample_lengths = torch.full((sample_batch_size,), sample_seq_len, device=device)
-
+   
+    print(f"The length of the train loader is {len(train_loader)}")
     # Initialize learning rate scheduler
-    learning_rate_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=cfg['training']['lr_scheduler_factor'],
-        patience=cfg['training']['lr_scheduler_patience'],
-        min_lr=cfg['training']['min_lr']
-    )
+    scheduler_type = cfg.training.get('lr_scheduler_type', 'ReduceLROnPlateau')
+    if scheduler_type == "OneCycleLR":
+        steps_per_epoch = len(train_loader)
+        max_lr = float(cfg.training.get('onecycle_max_lr', lr))
+        pct_start = float(cfg.training.get('onecycle_pct_start', 0.3))
+        div_factor = float(cfg.training.get('onecycle_div_factor', 25.0))
+        final_div_factor = float(cfg.training.get('onecycle_final_div_factor', 1e4))
+        learning_rate_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=max_lr,
+            steps_per_epoch=steps_per_epoch,
+            epochs=epochs,
+            pct_start=pct_start,
+            div_factor=div_factor,
+            final_div_factor=final_div_factor,
+            anneal_strategy='cos'
+        )
+        learning_rate_scheduler_str = (
+            f"OneCycleLR_maxlr_{max_lr}_epochs_{epochs}_steps_per_epoch_{steps_per_epoch}"
+        )
+    else:
+        learning_rate_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=cfg.training.lr_scheduler_factor,
+            patience=cfg.training.lr_scheduler_patience,
+            min_lr=cfg.training.min_lr
+        )
+        learning_rate_scheduler_str = f"ReduceLROnPlateau_factor_{learning_rate_scheduler.factor}_patience_{learning_rate_scheduler.patience}"
 
-    #learning rate scheduler to string
-    learning_rate_scheduler_str = f"ReduceLROnPlateau_factor_{learning_rate_scheduler.factor}_patience_{learning_rate_scheduler.patience}"
+    print(f"Learning rate scheduler: {learning_rate_scheduler_str}")
 
     #phi_hidden_dims and rho_hiddens_dims to string
     phi_hidden_dims_str = '_'.join(str(dim) for dim in phi_hidden_dims)
     rho_hidden_dims_str = '_'.join(str(dim) for dim in rho_hidden_dims)
-    name = f"DeepSet_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_weighted_loss_{weighted_loss}_feature_transform_{feature_transform}_phi_hidden_dims_{phi_hidden_dims_str}_rho_hidden_dims_{rho_hidden_dims_str}_seed_{seed}_samples_per_complex_{samples_per_complex}_aggregator_{aggregator}_lr_scheduler_{learning_rate_scheduler_str}"
+    name = f"DeepSet_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_weighted_loss_{weighted_loss}_aggregator_{aggregator}_lr_scheduler_{learning_rate_scheduler_str}"
 
     # Initialize W&B run
     wandb.init(
         entity=os.getenv("WANDB_ENTITY"),
         project=os.getenv("WANDB_PROJECT"), 
-        config=cfg,
+        config=OmegaConf.to_container(cfg, resolve=True), # Convert OmegaConf to dict for wandb
         name=name
     )
 
     wandb.watch(model, log="all", log_graph=True)
     # Run a forward pass with the sample input (this will be captured by wandb.watch)
+    # Create a sample input for wandb to trace the model
+    sample_batch_size = batch_size
+    sample_complex_size = samples_per_complex
+    sample_seq_len = 20
+    sample_input_dim = cfg.model.input_dim
+    sample_x = torch.zeros((sample_batch_size, sample_complex_size, sample_seq_len, sample_input_dim), device=device)
+    sample_lengths = torch.full((sample_batch_size, sample_complex_size), sample_seq_len, device=device)
+
     with torch.no_grad():
         _ = model(sample_x, sample_lengths)
 
     # Initialize checkpoint path and save config
-    ckpt_output_dir = os.path.join(args.output_dir, name)
+    ckpt_output_dir = os.path.join(cfg.output_dir, name)
     os.makedirs(ckpt_output_dir, exist_ok=True)
     with open(os.path.join(ckpt_output_dir, 'config.yaml'), 'w') as f:
-        yaml.dump(cfg, f)
+        OmegaConf.save(config=cfg, f=f) # Use OmegaConf to save
     
     #clean up memory
     torch.cuda.empty_cache()
@@ -202,6 +252,12 @@ def main():
     lengths = biggest_batch['lengths'].to(device)
     labels = biggest_batch['label'].to(device)
     weights= biggest_batch['weight'].to(device)
+    complex_id = biggest_batch['complex_id']
+    # print(f"feats shape: {feats.shape}")
+    # print(f"lengths shape: {lengths.shape}")
+    # print(f"labels shape: {labels.shape}")
+    # print(f"weights shape: {weights.shape}")
+    # print(f"complex_id shape: {complex_id.shape}")
     _ = model(feats, lengths)
     
     #clean up memory
@@ -209,8 +265,9 @@ def main():
     
     # --- resume logic: load checkpoint if requested and bump start_epoch ---
     start_epoch = 1
-    if args.resume is not None:
-        checkpoint = torch.load(args.resume, map_location=device)
+    resume_path = cfg.get('resume', None) # Get resume path from config
+    if resume_path is not None:
+        checkpoint = torch.load(resume_path, map_location=device)
         # full checkpoint with epoch, model+opt states?
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
@@ -245,10 +302,19 @@ def main():
         abs_errors = np.array([0.0])  # Initialize abs_errors here
 
         for batch in train_loader:
+            #print the batch size
+            # print(f"Batch size: {batch['features'].shape[0]}")
+            #print the number of complexes in the batch
+            # print(f"Number of complexes in the batch: {len(batch['complex_id'])}")
+            # print(f"Batch: {batch}")
             loss, grad_norm, batch_size, avg_dockq = train_step(
                 model, batch, optimizer, base_criterion, device, weighted_loss, adaptive_weight
             )
 
+            # Update learning rate
+            if scheduler_type == "OneCycleLR":
+                learning_rate_scheduler.step()
+                
             running_loss += loss
             running_grad_norm += grad_norm
             log_interval_counter += 1
@@ -310,12 +376,14 @@ def main():
                 
                 print(f"Epoch {epoch}/{epochs} step {log_interval_counter}/{len(train_loader)} — Train loss: {avg_loss:.8f}")
                 
-                # Update learning rate
-                learning_rate_scheduler.step(val_loss)
+                
+                
                 #after validation bring the model back to training mode
                 model.train()
         
         avg_val_loss = avg_val_loss_per_epoch / max(log_step_per_epoch, 1)
+        if scheduler_type != "OneCycleLR":
+            learning_rate_scheduler.step(avg_val_loss)
         print(f"Epoch {epoch}/{epochs}, Elapsed time: {time.time() - epoch_start:.2f}s, Train loss: {avg_loss:.8f} —  Val loss: {avg_val_loss:.8f} —  Val abs error mean: {abs_errors.mean():.8f}")
 
         
@@ -340,13 +408,14 @@ def run_validation(model, val_loader, base_criterion, device, weighted_loss):
         for batch in val_loader:
             feats  = batch['features'].to(device)
             lengths = batch['lengths'].to(device)
-            labels = batch['label'].to(device)
+            labels = batch['label'].to(device) # Already logit transformed
             weights= batch['weight'].to(device)  # still available
+            complex_id = batch['complex_id']
 
             # transform labels via a clipped logit function
-            epsilon = 1e-6
-            labels = torch.clamp(labels, min=epsilon, max=1-epsilon)
-            labels = torch.log(labels / (1-labels))
+            # epsilon = 1e-6
+            # labels = torch.clamp(labels, min=epsilon, max=1-epsilon)
+            # labels = torch.log(labels / (1-labels)) # Already done in DataLoader
 
             logits = model(feats, lengths)
             losses = base_criterion(logits, labels)
@@ -358,14 +427,15 @@ def run_validation(model, val_loader, base_criterion, device, weighted_loss):
             val_loss += loss.item()
             val_count += feats.size(0)
 
-            # convert back labels and logits to 0-1
-            labels = torch.sigmoid(labels)
-            logits = torch.sigmoid(logits)
+            # convert back labels and logits to 0-1 for metrics
+            # Labels are already logit transformed, so apply sigmoid to convert back for comparison
+            labels_original_scale = torch.sigmoid(labels)
+            logits_original_scale = torch.sigmoid(logits)
 
-            val_preds.append(logits.cpu().numpy())
-            val_labels.append(labels.cpu().numpy())
+            val_preds.append(logits_original_scale.cpu().numpy())
+            val_labels.append(labels_original_scale.cpu().numpy())
 
-    val_loss /= val_count
+    val_loss /= val_count # val_loss should be divided by number of samples, not batches
     val_preds = np.concatenate(val_preds)
     val_labels = np.concatenate(val_labels)
     return val_loss, val_preds, val_labels
@@ -373,15 +443,15 @@ def run_validation(model, val_loader, base_criterion, device, weighted_loss):
 def train_step(model, batch, optimizer, base_criterion, device, weighted_loss, adaptive_weight):
     feats  = batch['features'].to(device)
     lengths = batch['lengths'].to(device)
-    labels = batch['label'].to(device)
+    labels = batch['label'].to(device) # Already logit transformed
     weights= batch['weight'].to(device)
-    
+    complex_id = batch['complex_id']
 
-    avg_dockq = labels.mean().item()
+    avg_dockq = torch.sigmoid(labels).mean().item() # Calculate avg_dockq on original scale for logging
     # Transform labels via a clipped logit function
-    epsilon = 1e-6
-    labels = torch.clamp(labels, min=epsilon, max=1-epsilon)
-    labels = torch.log(labels / (1-labels))
+    # epsilon = 1e-6
+    # labels = torch.clamp(labels, min=epsilon, max=1-epsilon)
+    # labels = torch.log(labels / (1-labels)) # Already done in DataLoader
 
     optimizer.zero_grad()
     logits = model(feats, lengths)
@@ -391,12 +461,15 @@ def train_step(model, batch, optimizer, base_criterion, device, weighted_loss, a
         # Compute adaptive weight: focus more on extreme targets (DockQ near 0 or 1)
         with torch.no_grad():
             # Compute confidence weight: focus more on extreme targets (DockQ near 0 or 1 do this per label)
-            confidence_weight = 1.0 + 4.0 * ((labels < 0.1) | (labels > 0.9))
+            # adaptive weight should operate on the logit-transformed labels
+            confidence_weight = 1.0 + 4.0 * ((torch.sigmoid(labels) < 0.1) | (torch.sigmoid(labels) > 0.9))
             # print(f"Confidence weight: {confidence_weight}")
             # print(f"Labels: {labels}")
         
         # apply confidence weight to weights
         weights = weights * confidence_weight
+    # print(f"Weights: {weights}, weights shape: {weights.shape}")
+    # print(f"Losses: {losses}, losses shape: {losses.shape}")
 
     if weighted_loss:
         loss   = (losses * weights).mean()

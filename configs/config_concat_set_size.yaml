@@ -12,7 +12,7 @@ data:
   feature_centering: true
 
 model:
-  input_dim: 3
+  input_dim: 4
   aggregator: concat_stats_by_set_size
   phi_hidden_dims: [128, 128, 128]
   rho_hidden_dims: [128, 128, 128]
@@ -28,7 +28,12 @@ training:
   bucket_balance: true
   num_buckets: 4
   seed: 42
+  lr_scheduler_type: "OneCycleLR"  # or "ReduceLROnPlateau"
   lr_scheduler_factor: 0.75
-  lr_scheduler_patience: 15
+  lr_scheduler_patience: 5
   min_lr: !!float 1e-6
   adaptive_weight: true
+  onecycle_max_lr: 0.01         # Only used if lr_scheduler_type is OneCycleLR
+  onecycle_pct_start: 0.3       # Only used if lr_scheduler_type is OneCycleLR
+  onecycle_div_factor: 25.0     # Only used if lr_scheduler_type is OneCycleLR
+  onecycle_final_div_factor: 1e4 # Only used if lr_scheduler_type is OneCycleLR

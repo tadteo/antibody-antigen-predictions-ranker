@@ -15,6 +15,7 @@ class DeepSet(nn.Module):
             phi_layers.append(nn.Linear(prev_dim, h))
             phi_layers.append(nn.LeakyReLU(0.1))
             phi_layers.append(nn.LayerNorm(h))
+            phi_layers.append(nn.Dropout(0.1))
             prev_dim = h
         self.phi = nn.Sequential(*phi_layers)
 
@@ -38,80 +39,123 @@ class DeepSet(nn.Module):
         for h in rho_hidden_dims:
             rho_layers.append(nn.Linear(prev_dim, h))
             rho_layers.append(nn.ReLU())
+            rho_layers.append(nn.Dropout(0.1))
             prev_dim = h
         rho_layers.append(nn.Linear(prev_dim, output_dim))
         #No sigmoid here because we want to use Huber loss and it will choke the gradient 
         self.rho = nn.Sequential(*rho_layers)
 
     def forward(self, x, lengths):
-        # x: [batch_size, set_size, input_dim]
-        B, N, D = x.shape
+        # x: [batch_size, complex_size, set_size, input_dim]
+        B, K, N, F = x.shape
+        # print(f"x shape: {x.shape}")
+        # print(f"lengths shape: {lengths.shape}")
         # 1) flat→phi→reshape
-        h = self.phi(x.reshape(B*N, D)).view(B, N, -1)  # [B, N, H]
-
+        h = self.phi(x.reshape(B*K*N, F)).view(B, K, N, -1)  # [B, K, N, F]
+        # print(f"h shape: {h.shape}")
         # build a mask: True where j < lengths[i]
         device = x.device
-        arange = torch.arange(N, device=device)[None, :]     # [1, N]
-        mask   = (arange < lengths[:, None]).float()         # [B, N]
-        counts = mask.sum(dim=1, keepdim=True).clamp(min=1.0)  # [B,1]
-        valid = mask.unsqueeze(-1)                    # [B,N,1]
+        arange = torch.arange(N, device=device)[None,None, :]     # [1, 1, N]
+        # print(f"arange shape: {arange.shape}")
+        mask   = (arange < lengths[:, :,None]).float()         # [B, K, N]
+        # print(f"mask shape: {mask.shape}")
+        counts = mask.sum(dim=2, keepdim=True).clamp(min=1.0)  # [B, K, 1]
+        # print(f"counts shape: {counts.shape}")
+        valid = mask.unsqueeze(-1)                    # [B,K,N,1]
+        
+        epsilon = 1e-8 # Epsilon for numerical stability
 
         # sum over padded slots will be zero; 
         if self.aggregator == 'sum':
-            agg = (h * valid).sum(dim=1)
+            agg = (h * valid).sum(dim=2) # Shape: [B, K, H]
+            # Normalize across K samples for each complex
+            mu = agg.mean(dim=1, keepdim=True)
+            std = agg.std(dim=1, keepdim=True)
+            agg = (agg - mu) / (std + epsilon)
         elif self.aggregator == 'sum_by_set_size':
             # divide by the true length
-            weighted = h * valid                    # [B, N, H]
-            agg     = weighted.sum(dim=1) / counts  # [B, H]
+            weighted = h * valid                    # [B, K, N, H]
+            agg     = weighted.sum(dim=2) / counts  # [B, K, H]
+            # Normalize across K samples for each complex
+            mu = agg.mean(dim=1, keepdim=True)
+            std = agg.std(dim=1, keepdim=True)
+            agg = (agg - mu) / (std + epsilon)
         elif self.aggregator == 'attn_pool':
             # attention pooling without size normalization, with stable softmax
-            Q = self.pool_q.unsqueeze(0).expand(B, -1).unsqueeze(1)  # [B,1,H]
-            K = self.attn_w(h)                                      # [B,N,H]
-            scores = (Q * K).sum(-1) / math.sqrt(K.size(-1))        # [B,N]
-            # stability: subtract max per row
+            Q = self.pool_q.unsqueeze(0).expand(B*K, -1).unsqueeze(1)  # [B*K,1,H]
+            K_val = self.attn_w(h.view(B*K, N, -1))                     # [B*K,N,H]
+            scores = (Q * K_val).sum(-1) / math.sqrt(K_val.size(-1))    # [B*K,N]
+            
+            current_mask = mask.view(B*K, N) # Mask for B*K samples
             max_scores = scores.max(dim=1, keepdim=True)[0]
             scores = scores - max_scores
-            scores = scores.masked_fill(mask == 0, float('-inf'))
-            alpha = torch.softmax(scores, dim=1).unsqueeze(-1)
-            agg = (alpha * h).sum(dim=1)       
-
+            scores = scores.masked_fill(current_mask == 0, float('-inf'))
+            alpha = torch.softmax(scores, dim=1).unsqueeze(-1)      # [B*K,N,1]
+            agg_flat = (alpha * h.view(B*K,N,-1)).sum(dim=1)         # [B*K,H]
+            agg = agg_flat.view(B, K, -1)                           # [B,K,H]
+            # Normalize across K samples for each complex
+            mu = agg.mean(dim=1, keepdim=True)
+            std = agg.std(dim=1, keepdim=True)
+            agg = (agg - mu) / (std + epsilon)
         elif self.aggregator == 'attn_pool_by_set_size':
             # attention pooling with size normalization and stable softmax
-            Q = self.pool_q.unsqueeze(0).expand(B, -1).unsqueeze(1)
-            K = self.attn_w(h)
-            scores = (Q * K).sum(-1) / math.sqrt(K.size(-1))
+            Q = self.pool_q.unsqueeze(0).expand(B*K, -1).unsqueeze(1) # [B*K,1,H]
+            K_val = self.attn_w(h.view(B*K, N, -1))                    # [B*K,N,H]
+            scores = (Q * K_val).sum(-1) / math.sqrt(K_val.size(-1))   # [B*K,N]
+
+            current_mask = mask.view(B*K, N) # Mask for B*K samples
             max_scores = scores.max(dim=1, keepdim=True)[0]
             scores = scores - max_scores
-            scores = scores.masked_fill(mask == 0, float('-inf'))
-            alpha = torch.softmax(scores, dim=1).unsqueeze(-1)
-            pooled = (alpha * h).sum(dim=1)
-            agg = pooled / counts                                   # [B,H]  
+            scores = scores.masked_fill(current_mask == 0, float('-inf'))
+            alpha = torch.softmax(scores, dim=1).unsqueeze(-1)   # [B*K,N,1]
+            pooled_flat = (alpha * h.view(B*K,N,-1)).sum(dim=1)   # [B*K,H]
+            # Reshape counts to [B*K, 1] for division
+            current_counts = counts.view(B*K, 1)
+            agg_flat = pooled_flat / current_counts              # [B*K,H]  
+            agg = agg_flat.view(B, K, -1)                        # [B,K,H]
+            # Normalize across K samples for each complex
+            mu = agg.mean(dim=1, keepdim=True)
+            std = agg.std(dim=1, keepdim=True)
+            agg = (agg - mu) / (std + epsilon)
         elif self.aggregator == 'concat_stats':
-            sum_pool = (h * valid).sum(dim=1)              # [B, H]
-            mean_pool = sum_pool / counts                   # [B, H]
-            # max pooling (with masking)
+            sum_pool = (h * valid).sum(dim=2)              # [B, K, H]
+            mean_pool = sum_pool / counts                   # [B, K, H]
             neg_inf = -1e9
             h_masked = h + (1.0 - valid) * neg_inf
-            max_pool, _ = h_masked.max(dim=1)               # [B, H]
-            size_feat = counts.sqrt()                       # [B, 1]
-            # concatenate: [sum, mean, max, sqrt(n)]
-            agg = torch.cat([sum_pool, mean_pool, max_pool, size_feat], dim=1)
+            max_pool, _ = h_masked.max(dim=2)               # [B, K, H]
+            size_feat = counts.sqrt()                       # [B, K, 1]
+            
+            phi_derived_features = torch.cat([sum_pool, mean_pool, max_pool], dim=2) # [B, K, 3H]
+            
+            mu = phi_derived_features.mean(dim=1, keepdim=True)
+            std = phi_derived_features.std(dim=1, keepdim=True)
+            normalized_phi_features = (phi_derived_features - mu) / (std + epsilon)
+            
+            agg = torch.cat([normalized_phi_features, size_feat], dim=2) # [B, K, 3H+1]
         elif self.aggregator == 'concat_stats_by_set_size':
-            # three statistics, each normalized by set size
-            mean1 = (h * valid).sum(dim=1) / counts       # [B,H]
-            # max over valid entries
+            mean1 = (h * valid).sum(dim=2) / counts       # [B,K,H]
             neg_inf = -1e9
             h_masked = h + (1.0 - valid) * neg_inf
-            max_pool, _ = h_masked.max(dim=1)                # [B,H]
-            # normalize max by set size
-            max_pool = max_pool / counts                    # [B,H]
-            size_feat = counts.sqrt()                     # [B,1]
-            agg = torch.cat([mean1, max_pool, size_feat], dim=1)
+            max_pool, _ = h_masked.max(dim=2)                # [B,K,H]
+            max_pool_norm_by_size = max_pool / counts        # [B,K,H] This was an error in reasoning before, max_pool should not be normalized by counts again if mean1 is already mean. Let's use raw max_pool.
+            
+            # Let's use mean1 and the original max_pool (before any division by counts)
+            phi_derived_features = torch.cat([mean1, max_pool], dim=2) # [B, K, 2H]
+            size_feat = counts.sqrt()                                  # [B, K, 1]
+
+            mu = phi_derived_features.mean(dim=1, keepdim=True)
+            std = phi_derived_features.std(dim=1, keepdim=True)
+            normalized_phi_features = (phi_derived_features - mu) / (std + epsilon)
+            
+            agg = torch.cat([normalized_phi_features, size_feat], dim=2) # [B, K, 2H+1]
         else:
             raise ValueError(f"Unknown aggregator: {self.aggregator}")
         
-        # 3) rho→out
-        out = self.rho(agg)   # [B, output_dim]
+        # print(f"agg shape after aggregation and normalization: {agg.shape}")
+
+        # Rho network
+        out = self.rho(agg)   # [B, K, output_dim]
+        # print(f"out shape: {out.shape}")
         return out.squeeze(-1)
 
 def init_weights(module):
