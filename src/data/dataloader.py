@@ -212,7 +212,7 @@ class WeightedComplexSampler(Sampler):
             total_samples = self.number_of_complexes * self.samples_per_complex
         else:
             # If samples_per_complex specified, return total number of samples per epoch
-            total_samples = len(self.df)
+            total_samples = len(self.df)/self.samples_per_complex
         
         return math.ceil(total_samples / self.batch_size)
 

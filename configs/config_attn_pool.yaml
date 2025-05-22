@@ -1,27 +1,24 @@
-# Default configuration for project
-
-num_samples_per_complex: None # Number of samples per complex used in each epoch
-
 data:
   raw_dir: data/raw
   processed_dir: data/processed
   processed_file: processed_data.h5
   splits_dir: data/raw_splits
-  manifest_file: data/manifest_filtered_pae_centered_density_with_clipping.csv
+  manifest_file: data/manifest_filtered_pae_centered_density_with_clipping_500k_maxlen.csv
   feature_transform: true
-  feature_centering: true #if feature centering is true, the input dim is 4
+  feature_centering: true
+  batch_size: 4 #8 max batch for sum aggregators #6 max batch for concat_stats aggregator #4 max batch for attn_pool aggregator
+  num_workers: 4
+  samples_per_complex: 2
 
 model:
-  input_dim: 4 #if feature centering is false, the input dim is 3
+  input_dim: 4
   aggregator: attn_pool
   phi_hidden_dims: [128, 128, 128]
   rho_hidden_dims: [128, 128, 128]
 
 training:
   adaptive_weight: true
-  batch_size: 3 #8 max batch for sum aggregators #6 max batch for concat_stats aggregator #4 max batch for attn_pool aggregator
-  num_workers: 4
-  epochs: 100
+  epochs: 150
   lr: !!float 1e-3
   weight_decay: !!float 1e-5
   smooth_l1_beta: 0.5
@@ -34,7 +31,10 @@ training:
   lr_scheduler_patience: 5
   min_lr: !!float 1e-6
   onecycle_max_lr: 0.01         # Only used if lr_scheduler_type is OneCycleLR
-  onecycle_pct_start: 0.3       # Only used if lr_scheduler_type is OneCycleLR
+  onecycle_pct_start: 0.2       # Only used if lr_scheduler_type is OneCycleLR
   onecycle_div_factor: 10.0     # Only used if lr_scheduler_type is OneCycleLR
-  onecycle_final_div_factor: !!float 100 # Only used if lr_scheduler_type is OneCycleLR
+  onecycle_final_div_factor: !!float 1000 # Only used if lr_scheduler_type is OneCycleLR
+  add_ranking_loss: true      # Whether to add the ranking loss
+  ranking_margin: 0.02         # Margin for the ranking loss
+  ranking_loss_weight: 0.2    # Lambda to weight the ranking loss component
 

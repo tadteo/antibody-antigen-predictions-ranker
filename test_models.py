@@ -48,7 +48,6 @@ def load_model_and_config(model_path, device):
     
     model = DeepSet(
         input_dim=model_cfg['input_dim'],
-        output_dim=model_cfg['output_dim'],
         phi_hidden_dims=model_cfg['phi_hidden_dims'],
         rho_hidden_dims=model_cfg['rho_hidden_dims'],
         aggregator=model_cfg['aggregator']
@@ -68,29 +67,35 @@ def load_model_and_config(model_path, device):
     return model
 
 def evaluate_model(model, dataloader, device):
-    all_preds, all_labels, all_complex_ids = [], [], []
+    all_preds, all_labels, all_complex_ids_flat = [], [], []
     with torch.no_grad():
         for batch in dataloader:
             feats = batch['features'].to(device)
             lengths = batch['lengths'].to(device)
-            labels = batch['label'].to(device)
+            labels = batch['label'].to(device) # Shape [B, K]
             
-            preds = model(feats, lengths)
+            preds = model(feats, lengths) # Shape [B, K]
             # convert back logits to 0-1 range
             preds = torch.sigmoid(preds)
             # also convert labels from logits to 0-1 range
             labels = torch.sigmoid(labels)
             
-            all_preds.append(preds.cpu().numpy())
-            all_labels.append(labels.cpu().numpy())
+            # Flatten predictions and labels for this batch
+            all_preds.append(preds.cpu().numpy().reshape(-1)) # Flatten to (B*K,)
+            all_labels.append(labels.cpu().numpy().reshape(-1)) # Flatten to (B*K,)
             
-            # If 'complex_id' is in the batch, add it to the list
-            if 'complex_id' in batch:
-                all_complex_ids.extend(batch['complex_id'])
+            # 'complex_id' from batch is [B, K]
+            # We need one complex_id string for each of the B*K predictions
+            batch_complex_ids = batch['complex_id'] # This is a np.array [B, K]
+            # Assuming complex_ids[:, 0] is the representative ID for all K samples of a complex
+            # Repeat each complex_id K times
+            ids_repeated = np.repeat(batch_complex_ids[:, 0], batch_complex_ids.shape[1])
+            all_complex_ids_flat.extend(ids_repeated.tolist())
     
     flat_preds = np.concatenate(all_preds)
     flat_labels = np.concatenate(all_labels)
-    return flat_preds, flat_labels, all_complex_ids
+    # all_complex_ids_flat is already a flat list of strings
+    return flat_preds, flat_labels, all_complex_ids_flat
 
 def get_model_info_from_path(model_path):
     # Extract the folder name that contains model details
@@ -143,69 +148,35 @@ def get_model_info_from_path(model_path):
         # Fallback to a hash-based name if parsing fails
         return f"model_{hash(folder_name) % 10000:04d}"
 
-def plot_results(preds, labels, model_name, model_info, output_dir, split):
-    plt.figure()
-    plt.scatter(labels, preds, alpha=0.5)
-    plt.xlabel('True Labels')
-    plt.ylabel('Predictions')
-    
-    # Create a safe filename with limited length but including more info
-    safe_model_info = model_info[:100]  # Allow longer names but still limit
-    filename = f'{model_name}_{safe_model_info}_scatter_{split}.png'
-    
-    # Ensure filename is not too long
-    if len(filename) > 200:  # Conservative limit
-        # Create a shorter filename using hash but keep some readable info
-        model_prefix = model_info[:50]  # Keep first 50 chars of model info
-        short_hash = hash(filename) % 10000
-        filename = f'{model_name}_{model_prefix}_{short_hash:04d}_scatter_{split}.png'
-    
-    plt.title(f'Model: {model_name}\n{safe_model_info}', fontsize=10)
-    plt.savefig(os.path.join(output_dir, filename))
-    plt.close()
-
 def plot_results_by_complex(preds, labels, complex_ids, model_name, model_info, output_dir, split):
     """Scatter plot of preds vs labels, colored by complex_id."""
-    # Make sure all arrays are flattened
+    # Make sure all arrays are flattened (preds and labels should be already)
     preds = np.array(preds).flatten()
     labels = np.array(labels).flatten()
     
-    # If complex_ids is empty or None, generate dummy IDs
+    # complex_ids should now be a flat list of strings
     if not complex_ids:
         print("No complex IDs provided, generating dummy IDs...")
         complex_ids = [f"complex_{i}" for i in range(len(preds))]
         
-    # If number of complex IDs doesn't match predictions, repeat them to match
+    # Check if number of complex IDs matches predictions.
+    # This check might be less critical now if evaluate_model handles alignment.
     if len(complex_ids) != len(preds):
-        print(f"Warning: Number of complex IDs ({len(complex_ids)}) doesn't match number of predictions ({len(preds)})")
-        print("This might be due to multiple predictions per complex.")
-        
-        # Option 1: Repeat complex IDs to match predictions (if predictions are ordered by complex)
-        # Calculate how many predictions per complex on average
-        if len(preds) > len(complex_ids):
-            repeat_factor = len(preds) // len(complex_ids)
-            remainder = len(preds) % len(complex_ids)
-            
-            # Repeat each complex ID repeat_factor times
-            repeated_cids = []
-            for cid in complex_ids:
-                repeated_cids.extend([cid] * repeat_factor)
-            
-            # Add remainder elements if needed
-            if remainder > 0:
-                repeated_cids.extend([complex_ids[0]] * remainder)
-            
-            complex_ids = repeated_cids[:len(preds)]  # Truncate to match exactly
-            print(f"Expanded complex IDs by repeating them ({repeat_factor} times each)")
-        # If more complex IDs than predictions, truncate
-        else:
+        print(f"Warning: Number of complex IDs ({len(complex_ids)}) still doesn't match number of predictions ({len(preds)}) after changes.")
+        # Fallback: truncate or pad complex_ids if mismatch persists (should be rare)
+        if len(complex_ids) > len(preds):
             complex_ids = complex_ids[:len(preds)]
-            print("Truncated complex IDs to match predictions")
+        else:
+            complex_ids.extend([f"unknown_complex_{i}" for i in range(len(preds) - len(complex_ids))])
+
     
     # Create a numeric mapping for each unique complex_id
-    unique_cids = list(dict.fromkeys(complex_ids))
+    # complex_ids is now a list of strings, so dict.fromkeys will work
+    unique_cids = list(dict.fromkeys(complex_ids)) 
     cid2idx = {cid:i for i,cid in enumerate(unique_cids)}
-    colors = np.array([cid2idx[c] for c in complex_ids])
+    
+    # Handle cases where a complex_id might have been 'unknown_complex_x' if padding occurred
+    colors = np.array([cid2idx.get(c, -1) for c in complex_ids]) # Use .get for safety if padding added new keys
     
     # Ensure all arrays have the same length for the final plot
     min_len = min(len(preds), len(labels), len(colors))
@@ -225,6 +196,8 @@ def plot_results_by_complex(preds, labels, complex_ids, model_name, model_info, 
     sc = plt.scatter(labels, preds, c=colors, cmap='tab20', s=20, alpha=0.6)
     plt.xlabel('True Labels'); plt.ylabel('Predictions')
     plt.title(f"{model_name}\n{safe_info}", fontsize=10)
+    plt.xlim(-0.05, 1.05)  # Set x-axis limits
+    plt.ylim(-0.05, 1.05)  # Set y-axis limits
 
     # if few complexes, label them in the colorbar
     if len(unique_cids) <= 20:
@@ -347,6 +320,10 @@ def main():
     all_model_infos = []
 
     for split in ['val', 'test', 'train']:
+        all_preds_labels_split = [] # Reset for each split
+        all_model_names_split = []
+        all_model_infos_split = []
+
         for model_path in model_paths:
             base_name = os.path.basename(model_path).replace('.pt', '')
             model_info = get_model_info_from_path(model_path)
@@ -379,22 +356,18 @@ def main():
                 split=split,
                 batch_size=8,
                 num_workers=2,
+                samples_per_complex=model_config['data'].get('samples_per_complex', 1),
                 feature_transform=model_config['data'].get('feature_transform', True),
                 feature_centering=model_config['data'].get('feature_centering', True),
-                number_of_samples_per_feature=model_config['data'].get('number_of_samples_per_feature')
+                seed=model_config['data'].get('seed', 42)
             )
 
             print(f"Testing model: {model_name} with info: {model_info}")
             model = load_model_and_config(model_path, device)
-            preds, labels, model_complex_ids = evaluate_model(model, test_loader, device)
+            preds, labels, model_complex_ids_flat = evaluate_model(model, test_loader, device)
             
-            # Use the complex IDs from the model if available, otherwise use those from the manifest
-            if model_complex_ids:
-                print(f"Using {len(model_complex_ids)} complex IDs from model evaluation")
-                complex_ids_to_use = model_complex_ids
-            else:
-                print(f"Using {len(test_cids)} complex IDs from manifest")
-                complex_ids_to_use = test_cids
+            # model_complex_ids_flat from evaluate_model is now the definitive list of IDs
+            complex_ids_to_use = model_complex_ids_flat
             
             print(f"Number of predictions: {len(preds)}, Number of complex IDs: {len(complex_ids_to_use)}")
             
@@ -404,14 +377,15 @@ def main():
             
             mse = ((preds - labels) ** 2).mean()
             print(f"{model_name} - Test MSE: {mse:.4f}")
-            plot_results(preds, labels, model_name, model_info, output_dir, split)
             plot_results_by_complex(preds, labels, complex_ids_to_use, model_name, model_info, output_dir, split)
-            all_preds_labels.append((preds, labels))
-            all_model_names.append(model_name)
-            all_model_infos.append(model_info)
+            
+            all_preds_labels_split.append((preds, labels)) # Use split-specific list
+            all_model_names_split.append(model_name)
+            all_model_infos_split.append(model_info)
 
-        # Plot all models together
-        plot_all_results(all_preds_labels, all_model_names, all_model_infos, output_dir, split)
+        # Plot all models together for the current split
+        if all_preds_labels_split: # Ensure there's data for the split
+            plot_all_results(all_preds_labels_split, all_model_names_split, all_model_infos_split, output_dir, split)
 
 if __name__ == '__main__':
     main()

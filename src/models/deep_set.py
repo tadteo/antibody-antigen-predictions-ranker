@@ -145,7 +145,9 @@ class DeepSet(nn.Module):
 
             mu = phi_derived_features.mean(dim=1, keepdim=True)
             std = phi_derived_features.std(dim=1, keepdim=True)
-            normalized_phi_features = (phi_derived_features - mu) / (std + epsilon)
+            # normalized_phi_features = (phi_derived_features - mu) / (std + epsilon)
+            # normalized_phi_features = (phi_derived_features - mu)
+            normalized_phi_features = phi_derived_features
             
             agg = torch.cat([normalized_phi_features, size_feat], dim=2) # [B, K, 2H+1]
         else:

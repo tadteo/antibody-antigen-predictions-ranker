@@ -25,6 +25,44 @@ from src.data.dataloader import (
 )
 from src.models.deep_set import DeepSet, init_weights
 
+def pairwise_soft_rank(scores, tau=0.02):
+    """
+    scores : Tensor [..., K]
+    returns soft ranks of same shape
+    """
+    diff = scores.unsqueeze(-1) - scores.unsqueeze(-2)        # [..., K, K]
+    P    = torch.sigmoid(diff / tau)                          # pairwise probs
+    # P_ii = sigmoid(0) = 0.5.
+    # soft_rank_i = 1 + sum_{j!=i} sigmoid((s_i - s_j)/tau)
+    # P.sum(dim=-1)_i = sum_j P_ij = sum_{j!=i} P_ij + P_ii
+    # So, 1 + P.sum(dim=-1)_i - P_ii leads to the correct formula.
+    soft_rank = 1 + P.sum(dim=-1) - torch.diagonal(P, dim1=-2, dim2=-1)
+    return soft_rank
+
+def spearman_soft_loss(pred, target, tau=0.02):
+    """
+    pred, target : shape [B, K] in DockQ (0–1) space
+    returns scalar 1 - ρ loss
+    Assumes K >= 2, which is handled by the caller.
+    """
+    K = pred.size(-1)
+    # This check is a safeguard, though the typical calling context (K > 1) should prevent K < 2.
+    if K < 2:
+        return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+
+    sr_pred = pairwise_soft_rank(pred,   tau)   # [B,K]
+    sr_true = pairwise_soft_rank(target, tau)   # [B,K]
+    
+    # Using the user's provided formulation for mse and rho_soft
+    mse = (sr_pred - sr_true).pow(2).mean(dim=-1) # per complex [B]
+    
+    # Denominator K * (K^2 - 1). This will be non-zero if K >= 2.
+    denominator = K * (K**2 - 1)
+    
+    rho_soft = 1 - 6 * mse / denominator # per complex [B]
+        
+    return (1 - rho_soft).mean()      # minimise 1 - ρ (scalar mean over batch)
+
 def main():
     # 1) Setup argument parsing
     parser = argparse.ArgumentParser(
@@ -105,6 +143,10 @@ def main():
     weight_decay        = cfg.training.weight_decay
     seed                = cfg.training.get('seed', None)
     weighted_loss       = cfg.training.get('weighted_loss', False)
+    # Ranking loss parameters
+    add_ranking_loss    = cfg.training.get('add_ranking_loss', False)
+    ranking_loss_weight = cfg.training.get('ranking_loss_weight', 0.1)
+    spearman_tau        = cfg.training.get('spearman_tau', 0.02)
 
     feature_transform   = cfg.data.feature_transform
     feature_centering   = cfg.data.get('feature_centering', False)
@@ -284,14 +326,17 @@ def main():
     
     #Setup variables useful for logging
     #We define a step as a batch (a gradient step)
-    log_interval = 150
+    log_interval = len(train_loader)//4
     log_interval_counter = 0
     running_loss = 0.0
     running_grad_norm = 0.0
     num_batches = 0
     last_log_time = time.time()
     running_avg_dockq = 0.0
-    
+    running_ranking_loss = 0.0 # For accumulating ranking loss
+    running_regression_loss = 0.0 # For accumulating regression loss
+    running_grad_norm_reg = 0.0 # For accumulating regression grad norm
+    running_grad_norm_rank = 0.0 # For accumulating ranking grad norm
     for epoch in range(start_epoch, epochs + 1):
         model.train()
         epoch_start = time.time()
@@ -307,41 +352,68 @@ def main():
             #print the number of complexes in the batch
             # print(f"Number of complexes in the batch: {len(batch['complex_id'])}")
             # print(f"Batch: {batch}")
-            loss, grad_norm, batch_size, avg_dockq = train_step(
-                model, batch, optimizer, base_criterion, device, weighted_loss, adaptive_weight
+            combined_loss_val, grad_norm, current_batch_size, avg_dockq, current_regression_loss, current_ranking_loss_val, grad_norm_reg, grad_norm_rank = train_step(
+                model, batch, optimizer, base_criterion, device, 
+                weighted_loss, adaptive_weight,
+                add_ranking_loss, spearman_tau, ranking_loss_weight
             )
 
             # Update learning rate
             if scheduler_type == "OneCycleLR":
                 learning_rate_scheduler.step()
                 
-            running_loss += loss
+            running_loss += combined_loss_val # This is now the combined loss
             running_grad_norm += grad_norm
             log_interval_counter += 1
             running_avg_dockq += avg_dockq
+            if add_ranking_loss:
+                running_ranking_loss += current_ranking_loss_val
+            running_regression_loss += current_regression_loss
+            running_grad_norm_reg += grad_norm_reg
+            running_grad_norm_rank += grad_norm_rank
             # Log every log_interval steps
             if log_interval_counter % log_interval == 0:
-                avg_loss = running_loss / log_interval_counter
-                avg_grad_norm = running_grad_norm / log_interval_counter
-                avg_dockq = running_avg_dockq / log_interval
+                avg_loss = running_loss / log_interval # Corrected: divide by log_interval not log_interval_counter for avg over interval
+                avg_grad_norm = running_grad_norm / log_interval # Corrected
+                avg_dockq_interval = running_avg_dockq / log_interval # Corrected
+                avg_regression_loss_interval = running_regression_loss / log_interval # Corrected
+                avg_grad_norm_reg_interval = running_grad_norm_reg / log_interval # Corrected
+                avg_grad_norm_rank_interval = running_grad_norm_rank / log_interval # Corrected
+
+
                 elapsed = time.time() - last_log_time
                 throughput = log_interval / elapsed if elapsed > 0 else 0.0
                 
-                #log training metrics to W&B
-                wandb.log({
-                    "train/loss": avg_loss,
+                log_dict = {
+                    "train/loss": avg_loss, # This is combined loss
                     "train/grad_norm": avg_grad_norm,
                     "train/lr": optimizer.param_groups[0]['lr'],
                     "train/throughput": throughput,
                     "train/epoch": epoch,
-                    "train/avg_dockq": avg_dockq,
-                }, step=log_interval_counter)
+                    "train/avg_dockq": avg_dockq_interval,
+                    "train/regression_loss": avg_regression_loss_interval,
+                    "train/grad_norm_reg": avg_grad_norm_reg_interval,
+                    "train/grad_norm_rank": avg_grad_norm_rank_interval,
+                    "train/grad_norm_reg_rank_ratio": avg_grad_norm_reg_interval / (avg_grad_norm_rank_interval + 1e-8),
+                }
+                if add_ranking_loss: # Log ranking loss only if it's being added
+                    avg_ranking_loss_interval = running_ranking_loss / log_interval # Corrected
+                    log_dict["train/ranking_loss"] = avg_ranking_loss_interval
+                    # Ratio of regression loss to ranking loss (values, not grads)
+                    log_dict["train/reg_vs_rank_loss_ratio"] = avg_regression_loss_interval / (avg_ranking_loss_interval + 1e-8) 
+                
+                wandb.log(log_dict, step=log_interval_counter)
 
                 # Reset running stats for next interval
                 running_loss = 0.0
                 running_grad_norm = 0.0
                 running_avg_dockq = 0.0
-                throughput = 0.0
+                running_regression_loss = 0.0
+                running_grad_norm_reg = 0.0
+                running_grad_norm_rank = 0.0
+                if add_ranking_loss:
+                    running_ranking_loss = 0.0
+                # throughput = 0.0 # throughput is recalculated, not accumulated
                 last_log_time = time.time()
 
                 #run validation as part of the logging
@@ -374,7 +446,7 @@ def main():
                 avg_val_loss_per_epoch += val_loss
                 log_step_per_epoch += 1
                 
-                print(f"Epoch {epoch}/{epochs} step {log_interval_counter}/{len(train_loader)} — Train loss: {avg_loss:.8f}")
+                print(f"Epoch {epoch}/{epochs} step {log_interval_counter%len(train_loader)}/{len(train_loader)} — Train loss: {avg_loss:.8f}")
                 
                 
                 
@@ -440,7 +512,9 @@ def run_validation(model, val_loader, base_criterion, device, weighted_loss):
     val_labels = np.concatenate(val_labels)
     return val_loss, val_preds, val_labels
 
-def train_step(model, batch, optimizer, base_criterion, device, weighted_loss, adaptive_weight):
+def train_step(model, batch, optimizer, base_criterion, device, 
+               weighted_loss, adaptive_weight,
+               add_ranking_loss, spearman_tau, ranking_loss_weight):
     feats  = batch['features'].to(device)
     lengths = batch['lengths'].to(device)
     labels = batch['label'].to(device) # Already logit transformed
@@ -448,45 +522,97 @@ def train_step(model, batch, optimizer, base_criterion, device, weighted_loss, a
     complex_id = batch['complex_id']
 
     avg_dockq = torch.sigmoid(labels).mean().item() # Calculate avg_dockq on original scale for logging
-    # Transform labels via a clipped logit function
-    # epsilon = 1e-6
-    # labels = torch.clamp(labels, min=epsilon, max=1-epsilon)
-    # labels = torch.log(labels / (1-labels)) # Already done in DataLoader
 
-    optimizer.zero_grad()
-    logits = model(feats, lengths)
-    losses = base_criterion(logits, labels)
+    optimizer.zero_grad() # Moved to the beginning of the step
+    logits = model(feats, lengths) # Shape: [B, K]
+    
+    # 1. Regression Loss (e.g., Huber)
+    regression_losses = base_criterion(logits, labels) # Shape: [B, K]
 
+    current_regression_weights = weights
     if adaptive_weight:
         # Compute adaptive weight: focus more on extreme targets (DockQ near 0 or 1)
         with torch.no_grad():
             # Compute confidence weight: focus more on extreme targets (DockQ near 0 or 1 do this per label)
             # adaptive weight should operate on the logit-transformed labels
             confidence_weight = 1.0 + 4.0 * ((torch.sigmoid(labels) < 0.1) | (torch.sigmoid(labels) > 0.9))
-            # print(f"Confidence weight: {confidence_weight}")
-            # print(f"Labels: {labels}")
-        
-        # apply confidence weight to weights
-        weights = weights * confidence_weight
-    # print(f"Weights: {weights}, weights shape: {weights.shape}")
-    # print(f"Losses: {losses}, losses shape: {losses.shape}")
+        current_regression_weights = current_regression_weights * confidence_weight
 
     if weighted_loss:
-        loss   = (losses * weights).mean()
+        regression_loss = (regression_losses * current_regression_weights).mean()
     else:
-        loss   = losses.mean()
+        regression_loss = regression_losses.mean()
 
-    loss.backward()
+    # Initialize gradient norms for individual losses
+    grad_norm_reg_val = 0.0
+    grad_norm_rank_val = 0.0
+
+    # Calculate grad norm for regression_loss
+    if isinstance(regression_loss, torch.Tensor) and regression_loss.requires_grad:
+        reg_grads_tuple = torch.autograd.grad(regression_loss, 
+                                              [p for p in model.parameters() if p.requires_grad], 
+                                              retain_graph=True, 
+                                              allow_unused=True)
+        valid_reg_grads = [g for g in reg_grads_tuple if g is not None]
+        if valid_reg_grads:
+            flat_reg_grads = torch.cat([g.contiguous().view(-1) for g in valid_reg_grads])
+            grad_norm_reg_val = torch.norm(flat_reg_grads, p=2).item()
+
+    total_combined_loss = regression_loss
+    final_ranking_loss_val = 0.0
+    
+    # Variable to store the tensor of the weighted ranking loss component for grad calculation
+    actual_weighted_ranking_loss_tensor_for_grad = None
+
+    # 2. Ranking Loss (Optional) - Switched to Soft Spearman Rank Loss
+    if add_ranking_loss and logits.size(1) > 1: # K > 1 for pairs
+        # Transform logits and labels to 0-1 scale (DockQ space) for Spearman loss
+        pred_sig = torch.sigmoid(logits)   # Shape: [B, K]
+        true_sig = torch.sigmoid(labels)   # Shape: [B, K]
+
+        # Continuous weighting approach
+        #TODO:check that this is correct
+        true_sig_std = true_sig.std(dim=1, keepdim=True) + 1e-6  # Add epsilon for stability
+        # Scale weight exponentially based on standard deviation
+        # More variation → higher weight for ranking loss
+        ranking_weight = torch.clamp(true_sig_std / 0.05, min=0.0, max=1.0) 
+
+        # Apply custom per-complex weight to the ranking loss
+        batch_spearman_losses = spearman_soft_loss(pred_sig, true_sig, tau=spearman_tau)  # Need to modify the loss function
+        weighted_spearman_loss = (batch_spearman_losses * ranking_weight.squeeze()).mean()
+        
+        if isinstance(weighted_spearman_loss, torch.Tensor):
+            actual_weighted_ranking_loss_tensor_for_grad = ranking_loss_weight * weighted_spearman_loss
+            
+            # Calculate grad norm for the ranking loss component
+            if actual_weighted_ranking_loss_tensor_for_grad.requires_grad:
+                rank_grads_tuple = torch.autograd.grad(actual_weighted_ranking_loss_tensor_for_grad,
+                                                       [p for p in model.parameters() if p.requires_grad],
+                                                       retain_graph=True, 
+                                                       allow_unused=True)
+                valid_rank_grads = [g for g in rank_grads_tuple if g is not None]
+                if valid_rank_grads:
+                    flat_rank_grads = torch.cat([g.contiguous().view(-1) for g in valid_rank_grads])
+                    grad_norm_rank_val = torch.norm(flat_rank_grads, p=2).item()
+            
+            total_combined_loss = total_combined_loss + actual_weighted_ranking_loss_tensor_for_grad
+            final_ranking_loss_val = weighted_spearman_loss.item() # Store the unweighted spearman loss
+        # If current_spearman_loss is not a tensor (e.g. from K<2 returning a float, though handled),
+        # then final_ranking_loss_val remains 0.0 and no ranking loss component is added.
+
+    # Gradients for individual losses are calculated for logging.
+    # Now, compute gradients for the total_combined_loss for the optimizer step.
+    total_combined_loss.backward()
     optimizer.step()
 
-    # Compute grad norm
+    # Compute grad norm for the combined loss (as it was)
     grad_norm = 0.0
     for p in model.parameters():
         if p.grad is not None:
             grad_norm += p.grad.data.norm(2).item() ** 2
     grad_norm = grad_norm ** 0.5
 
-    return loss.item(), grad_norm, feats.size(0), avg_dockq
+    return total_combined_loss.item(), grad_norm, feats.size(0), avg_dockq, regression_loss.item(), final_ranking_loss_val, grad_norm_reg_val, grad_norm_rank_val
 
 if __name__ == '__main__':
     main()

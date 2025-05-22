@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../phd_utils"
+		},
+		{
+			"path": "../abag/output"
+		}
+	],
+	"settings": {}
+}

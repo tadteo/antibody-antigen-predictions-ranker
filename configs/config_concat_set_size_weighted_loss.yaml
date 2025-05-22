@@ -1,6 +1,3 @@
-
-
-
 data:
   raw_dir: data/raw
   processed_dir: data/processed
@@ -9,19 +6,19 @@ data:
   manifest_file: data/manifest_filtered_pae_centered_density_with_clipping_500k_maxlen.csv
   feature_transform: true
   feature_centering: true
-  batch_size: 2 #8 max batch for sum aggregators #6 max batch for concat_stats aggregator #4 max batch for attn_pool aggregator
+  batch_size: 4 #8 max batch for sum aggregators #6 max batch for concat_stats aggregator #4 max batch for attn_pool aggregator
   num_workers: 4
   samples_per_complex: 3
 
 model:
   input_dim: 4
   aggregator: concat_stats_by_set_size
-  phi_hidden_dims: [128, 128, 128]
-  rho_hidden_dims: [128, 128, 128]
+  phi_hidden_dims: [128, 32, 64]
+  rho_hidden_dims: [256, 256, 256]
 
 training:
   adaptive_weight: true
-  epochs: 100
+  epochs: 150
   lr: !!float 1e-3
   weight_decay: !!float 1e-5
   smooth_l1_beta: 0.5
@@ -33,8 +30,10 @@ training:
   lr_scheduler_factor: 0.75
   lr_scheduler_patience: 5
   min_lr: !!float 1e-6
-  onecycle_max_lr: 0.01         # Only used if lr_scheduler_type is OneCycleLR
+  onecycle_max_lr: 0.005         # Only used if lr_scheduler_type is OneCycleLR
   onecycle_pct_start: 0.3       # Only used if lr_scheduler_type is OneCycleLR
   onecycle_div_factor: 10.0     # Only used if lr_scheduler_type is OneCycleLR
-  onecycle_final_div_factor: !!float 100 # Only used if lr_scheduler_type is OneCycleLR
-
+  onecycle_final_div_factor: !!float 1000 # Only used if lr_scheduler_type is OneCycleLR
+  add_ranking_loss: true      # Whether to add the ranking loss
+  spearman_tau: 0.02          # tau for the soft spearman rank loss
+  ranking_loss_weight: 0.75   # lambda for the ranking loss
