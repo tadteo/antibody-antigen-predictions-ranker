@@ -10,3 +10,6 @@ torchsummary>=1.5.1
 matplotlib>=3.5.0
 seaborn>=0.12.0
 statsmodels>=0.13.0
+DockQ
+tmtools
+biotite

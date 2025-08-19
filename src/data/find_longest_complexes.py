@@ -1,8 +1,16 @@
+#!/usr/bin/env python3
+"""
+This script is designed to find the longest complexes in a CSV file and write them to a new CSV file.
+
+to run:
+python find_longest_complexes.py --input-csv input_path_with_original_csv --output-csv output_path_with_longest_complexes_csv
+"""
+
 import csv
 import os # Added for path manipulation
 
 # Path to the input CSV file
-input_csv_file_path = "/proj/berzelius-2021-29/users/x_matta/antibody-antigen-predictions-ranker/data/manifest_filtered_pae_centered_density_with_clipping.csv"
+input_csv_file_path = "/proj/berzelius-2021-29/users/x_matta/antibody-antigen-predictions-ranker/data/manifest_new_filtered_pae_centered_density_with_clipping.csv"
 # Determine the output file path in the same directory as the input
 base_name_without_ext, ext = os.path.splitext(os.path.basename(input_csv_file_path))
 output_filename = f"{base_name_without_ext}_500k_maxlen{ext}"

@@ -1,0 +1,34 @@
+SAbDab Database Analysis Summary
+===================================
+
+Database Path: /proj/berzelius-2021-29/Database/sabdab/raw
+
+STATISTICS:
+-----------
+- Total PDB structures in summary.tsv: 9,546
+- Total PDB files available in directory: 9,506
+- PDB structures in both summary and files: 9,506
+- PDB structures MISSING from files: 40
+- PDB structures only in files (not in summary): 0
+
+MISSING STRUCTURES (40 total):
+------------------------------
+The following PDB IDs are referenced in summary.tsv but do not have corresponding .pdb files:
+
+8z8l, 8zbi, 8zbj, 8zca, 8zh7, 8zym, 9b7g, 9bnk, 9bnl, 9c0u, 
+9c0x, 9c2h, 9cb5, 9cp5, 9d0a, 9d4z, 9d8y, 9d90, 9d98, 9eci, 
+9ego, 9fns, 9fnt, 9fq3, 9ggp, 9gix, 9gu0, 9gu1, 9gu2, 9gu3, 
+9hy1, 9hy2, 9hy3, 9hy5, 9ixv, 9nox, 9o38, 9qub, 9quw, 9r2e
+
+OBSERVATIONS:
+------------
+1. All missing PDB IDs start with '8' or '9', indicating they are very recent structures
+2. These are likely newly released structures that haven't been downloaded yet
+3. No orphaned files exist (all available files are referenced in summary.tsv)
+4. The database appears to be mostly complete with only 0.42% missing structures
+
+RECOMMENDATIONS:
+---------------
+1. Download the 40 missing PDB files from the Protein Data Bank
+2. Update the download script to fetch these recent structures
+3. Consider implementing automated checks for missing structures 

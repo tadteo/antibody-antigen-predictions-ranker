@@ -1,0 +1,15 @@
+#! /bin/bash
+
+# setting up the environment
+module load Mambaforge
+mamba activate abag
+
+# setting up working directory
+cd /proj/berzelius-2021-29/users/x_matta/antibody-antigen-predictions-ranker/src/data/
+
+# running the script
+python 01_process_af3_predictions.py \
+    --metadata /proj/berzelius-2021-29/Database/simple_sabdab_db/test/test_metadata.csv \
+    --af3_folder /proj/berzelius-2021-29/users/x_malud/alphafold3/matteo/models-test/ \
+    --reference_folder /proj/berzelius-2021-29/Database/simple_sabdab_db/test/pdb \
+    --output /proj/berzelius-2021-29/users/x_matta/abag_af3_predictions/test/

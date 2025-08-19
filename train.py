@@ -2,7 +2,7 @@
 """
 train_deepset.py
 
-Train a DeepSet on antibody–antigen interchain PAE features using our new sampler & weighting.
+Train a DeepSet on antibody–antigen interchain PAE features.
 Usage:
     python train_deepset.py --config configs/config.yaml --output_dir out/
 """
@@ -42,26 +42,30 @@ def pairwise_soft_rank(scores, tau=0.02):
 def spearman_soft_loss(pred, target, tau=0.02):
     """
     pred, target : shape [B, K] in DockQ (0–1) space
-    returns scalar 1 - ρ loss
+    returns scalar 1 - ρ loss per complex [B]
     Assumes K >= 2, which is handled by the caller.
     """
     K = pred.size(-1)
-    # This check is a safeguard, though the typical calling context (K > 1) should prevent K < 2.
     if K < 2:
-        return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+        # Return a tensor of zeros with the batch dimension if K < 2,
+        # ensuring it's on the correct device and requires grad if inputs do.
+        # This allows .mean() to work downstream without error.
+        return torch.zeros(pred.size(0), device=pred.device, dtype=pred.dtype)
 
     sr_pred = pairwise_soft_rank(pred,   tau)   # [B,K]
     sr_true = pairwise_soft_rank(target, tau)   # [B,K]
     
-    # Using the user's provided formulation for mse and rho_soft
     mse = (sr_pred - sr_true).pow(2).mean(dim=-1) # per complex [B]
     
-    # Denominator K * (K^2 - 1). This will be non-zero if K >= 2.
     denominator = K * (K**2 - 1)
-    
+    # If K < 2, denominator could be 0. Handled by K < 2 check above.
+    # However, if K is exactly 0 or 1 due to an issue, ensure no division by zero.
+    if denominator == 0: # Should not happen if K >= 2 check is effective
+        return torch.zeros(pred.size(0), device=pred.device, dtype=pred.dtype)
+
     rho_soft = 1 - 6 * mse / denominator # per complex [B]
         
-    return (1 - rho_soft).mean()      # minimise 1 - ρ (scalar mean over batch)
+    return 1 - rho_soft # per complex [B], to be minimized (hence 1-rho)
 
 def main():
     # 1) Setup argument parsing
@@ -147,6 +151,7 @@ def main():
     add_ranking_loss    = cfg.training.get('add_ranking_loss', False)
     ranking_loss_weight = cfg.training.get('ranking_loss_weight', 0.1)
     spearman_tau        = cfg.training.get('spearman_tau', 0.02)
+    lambda_ema_alpha    = cfg.training.get('lambda_ema_alpha', 0.9) # For dynamic lambda smoothing
 
     feature_transform   = cfg.data.feature_transform
     feature_centering   = cfg.data.get('feature_centering', False)
@@ -333,10 +338,14 @@ def main():
     num_batches = 0
     last_log_time = time.time()
     running_avg_dockq = 0.0
-    running_ranking_loss = 0.0 # For accumulating ranking loss
-    running_regression_loss = 0.0 # For accumulating regression loss
-    running_grad_norm_reg = 0.0 # For accumulating regression grad norm
-    running_grad_norm_rank = 0.0 # For accumulating ranking grad norm
+    running_ranking_loss = 0.0 # For accumulating base ranking loss values
+    running_regression_loss = 0.0 # For accumulating regression loss values
+    running_grad_norm_reg = 0.0 # For accumulating ||grad(L_reg)||
+    running_grad_norm_rank = 0.0 # For accumulating ||grad(L_rank)||
+    
+    # Initialize dynamic lambda for ranking loss
+    dynamic_ranking_lambda = ranking_loss_weight # Starts with the config value
+
     for epoch in range(start_epoch, epochs + 1):
         model.train()
         epoch_start = time.time()
@@ -352,11 +361,17 @@ def main():
             #print the number of complexes in the batch
             # print(f"Number of complexes in the batch: {len(batch['complex_id'])}")
             # print(f"Batch: {batch}")
-            combined_loss_val, grad_norm, current_batch_size, avg_dockq, current_regression_loss, current_ranking_loss_val, grad_norm_reg, grad_norm_rank = train_step(
+            combined_loss_val, grad_norm, current_batch_size, avg_dockq, \
+            current_regression_loss, current_base_ranking_loss_val, \
+            current_grad_norm_reg, current_grad_norm_rank, \
+            updated_dynamic_lambda = train_step(
                 model, batch, optimizer, base_criterion, device, 
                 weighted_loss, adaptive_weight,
-                add_ranking_loss, spearman_tau, ranking_loss_weight
+                add_ranking_loss, spearman_tau, 
+                current_ranking_lambda=dynamic_ranking_lambda, # Pass current lambda
+                lambda_ema_alpha=lambda_ema_alpha
             )
+            dynamic_ranking_lambda = updated_dynamic_lambda # Update lambda for next step
 
             # Update learning rate
             if scheduler_type == "OneCycleLR":
@@ -367,18 +382,19 @@ def main():
             log_interval_counter += 1
             running_avg_dockq += avg_dockq
             if add_ranking_loss:
-                running_ranking_loss += current_ranking_loss_val
+                running_ranking_loss += current_base_ranking_loss_val # Accumulate base ranking loss
             running_regression_loss += current_regression_loss
-            running_grad_norm_reg += grad_norm_reg
-            running_grad_norm_rank += grad_norm_rank
+            running_grad_norm_reg += current_grad_norm_reg # Accumulate ||grad(L_reg)||
+            running_grad_norm_rank += current_grad_norm_rank # Accumulate ||grad(L_rank)||
+            
             # Log every log_interval steps
             if log_interval_counter % log_interval == 0:
-                avg_loss = running_loss / log_interval # Corrected: divide by log_interval not log_interval_counter for avg over interval
-                avg_grad_norm = running_grad_norm / log_interval # Corrected
-                avg_dockq_interval = running_avg_dockq / log_interval # Corrected
-                avg_regression_loss_interval = running_regression_loss / log_interval # Corrected
-                avg_grad_norm_reg_interval = running_grad_norm_reg / log_interval # Corrected
-                avg_grad_norm_rank_interval = running_grad_norm_rank / log_interval # Corrected
+                avg_loss = running_loss / log_interval 
+                avg_grad_norm = running_grad_norm / log_interval 
+                avg_dockq_interval = running_avg_dockq / log_interval 
+                avg_regression_loss_interval = running_regression_loss / log_interval
+                avg_grad_norm_reg_interval = running_grad_norm_reg / log_interval
+                avg_grad_norm_rank_interval = running_grad_norm_rank / log_interval
 
 
                 elapsed = time.time() - last_log_time
@@ -392,15 +408,16 @@ def main():
                     "train/epoch": epoch,
                     "train/avg_dockq": avg_dockq_interval,
                     "train/regression_loss": avg_regression_loss_interval,
-                    "train/grad_norm_reg": avg_grad_norm_reg_interval,
-                    "train/grad_norm_rank": avg_grad_norm_rank_interval,
+                    "train/grad_norm_reg": avg_grad_norm_reg_interval, # Log ||grad(L_reg)||
+                    "train/grad_norm_rank": avg_grad_norm_rank_interval, # Log ||grad(L_rank)||
                     "train/grad_norm_reg_rank_ratio": avg_grad_norm_reg_interval / (avg_grad_norm_rank_interval + 1e-8),
+                    "train/dynamic_ranking_lambda": dynamic_ranking_lambda, # Log current lambda
                 }
-                if add_ranking_loss: # Log ranking loss only if it's being added
-                    avg_ranking_loss_interval = running_ranking_loss / log_interval # Corrected
-                    log_dict["train/ranking_loss"] = avg_ranking_loss_interval
-                    # Ratio of regression loss to ranking loss (values, not grads)
-                    log_dict["train/reg_vs_rank_loss_ratio"] = avg_regression_loss_interval / (avg_ranking_loss_interval + 1e-8) 
+                if add_ranking_loss: 
+                    avg_base_ranking_loss_interval = running_ranking_loss / log_interval 
+                    log_dict["train/ranking_loss"] = avg_base_ranking_loss_interval # Log L_rank
+                    # Ratio of regression loss to base ranking loss (values, not grads)
+                    log_dict["train/reg_vs_rank_loss_ratio"] = avg_regression_loss_interval / (avg_base_ranking_loss_interval + 1e-8) 
                 
                 wandb.log(log_dict, step=log_interval_counter)
 
@@ -514,27 +531,37 @@ def run_validation(model, val_loader, base_criterion, device, weighted_loss):
 
 def train_step(model, batch, optimizer, base_criterion, device, 
                weighted_loss, adaptive_weight,
-               add_ranking_loss, spearman_tau, ranking_loss_weight):
+               add_ranking_loss, spearman_tau, 
+               current_ranking_lambda, # Lambda from previous step/initial (EMA smoothed)
+               lambda_ema_alpha # Smoothing factor for lambda EMA
+               ):
     feats  = batch['features'].to(device)
     lengths = batch['lengths'].to(device)
-    labels = batch['label'].to(device) # Already logit transformed
+    labels = batch['label'].to(device) 
     weights= batch['weight'].to(device)
-    complex_id = batch['complex_id']
+    # complex_id = batch['complex_id'] # Not used in current train_step logic beyond batch
 
-    avg_dockq = torch.sigmoid(labels).mean().item() # Calculate avg_dockq on original scale for logging
+    avg_dockq = torch.sigmoid(labels).mean().item() 
 
-    optimizer.zero_grad() # Moved to the beginning of the step
-    logits = model(feats, lengths) # Shape: [B, K]
+    params = [p for p in model.parameters() if p.requires_grad]
+
+    def calculate_grad_norm_from_tuple(grads_tuple):
+        valid_grads = [g for g in grads_tuple if g is not None]
+        if not valid_grads: return 0.0
+        # Ensure all are tensors before concatenating
+        if not all(isinstance(g, torch.Tensor) for g in valid_grads): return 0.0
+        flat_grads = torch.cat([g.contiguous().view(-1) for g in valid_grads])
+        return torch.norm(flat_grads, p=2).item()
+
+    optimizer.zero_grad() 
+    logits = model(feats, lengths) 
     
-    # 1. Regression Loss (e.g., Huber)
-    regression_losses = base_criterion(logits, labels) # Shape: [B, K]
+    # 1. Regression Loss
+    regression_losses = base_criterion(logits, labels) 
 
     current_regression_weights = weights
     if adaptive_weight:
-        # Compute adaptive weight: focus more on extreme targets (DockQ near 0 or 1)
         with torch.no_grad():
-            # Compute confidence weight: focus more on extreme targets (DockQ near 0 or 1 do this per label)
-            # adaptive weight should operate on the logit-transformed labels
             confidence_weight = 1.0 + 4.0 * ((torch.sigmoid(labels) < 0.1) | (torch.sigmoid(labels) > 0.9))
         current_regression_weights = current_regression_weights * confidence_weight
 
@@ -543,76 +570,86 @@ def train_step(model, batch, optimizer, base_criterion, device,
     else:
         regression_loss = regression_losses.mean()
 
-    # Initialize gradient norms for individual losses
-    grad_norm_reg_val = 0.0
-    grad_norm_rank_val = 0.0
-
     # Calculate grad norm for regression_loss
-    if isinstance(regression_loss, torch.Tensor) and regression_loss.requires_grad:
-        reg_grads_tuple = torch.autograd.grad(regression_loss, 
-                                              [p for p in model.parameters() if p.requires_grad], 
-                                              retain_graph=True, 
-                                              allow_unused=True)
-        valid_reg_grads = [g for g in reg_grads_tuple if g is not None]
-        if valid_reg_grads:
-            flat_reg_grads = torch.cat([g.contiguous().view(-1) for g in valid_reg_grads])
-            grad_norm_reg_val = torch.norm(flat_reg_grads, p=2).item()
+    grad_norm_reg_val = 0.0
+    if regression_loss.requires_grad and params: # Ensure params is not empty
+        # Detach regression_loss to prevent its graph from being modified by rank grad computation if model is shared
+        # However, retain_graph is True, so this should be fine.
+        reg_grads_tuple = torch.autograd.grad(regression_loss, params, retain_graph=True, allow_unused=True)
+        grad_norm_reg_val = calculate_grad_norm_from_tuple(reg_grads_tuple)
 
+    # Initialize for current step
     total_combined_loss = regression_loss
-    final_ranking_loss_val = 0.0
-    
-    # Variable to store the tensor of the weighted ranking loss component for grad calculation
-    actual_weighted_ranking_loss_tensor_for_grad = None
+    base_ranking_loss_for_log = 0.0 
+    grad_norm_rank_val = 0.0      # ||grad(L_rank)||
+    updated_lambda_for_next_step = current_ranking_lambda # Default if no ranking loss
 
-    # 2. Ranking Loss (Optional) - Switched to Soft Spearman Rank Loss
     if add_ranking_loss and logits.size(1) > 1: # K > 1 for pairs
-        # Transform logits and labels to 0-1 scale (DockQ space) for Spearman loss
-        pred_sig = torch.sigmoid(logits)   # Shape: [B, K]
-        true_sig = torch.sigmoid(labels)   # Shape: [B, K]
+        pred_sig = torch.sigmoid(logits)   
+        true_sig = torch.sigmoid(labels)   
 
-        # Continuous weighting approach
-        #TODO:check that this is correct
-        true_sig_std = true_sig.std(dim=1, keepdim=True) + 1e-6  # Add epsilon for stability
-        # Scale weight exponentially based on standard deviation
-        # More variation → higher weight for ranking loss
-        ranking_weight = torch.clamp(true_sig_std / 0.05, min=0.0, max=1.0) 
-
-        # Apply custom per-complex weight to the ranking loss
-        batch_spearman_losses = spearman_soft_loss(pred_sig, true_sig, tau=spearman_tau)  # Need to modify the loss function
-        weighted_spearman_loss = (batch_spearman_losses * ranking_weight.squeeze()).mean()
+        with torch.no_grad(): # ranking_relevance_weight should not contribute to gradients directly
+            true_sig_std = true_sig.std(dim=1, keepdim=True) + 1e-6  
+            ranking_relevance_weight = torch.clamp(true_sig_std / 0.05, min=0.0, max=1.0) 
         
-        if isinstance(weighted_spearman_loss, torch.Tensor):
-            actual_weighted_ranking_loss_tensor_for_grad = ranking_loss_weight * weighted_spearman_loss
-            
-            # Calculate grad norm for the ranking loss component
-            if actual_weighted_ranking_loss_tensor_for_grad.requires_grad:
-                rank_grads_tuple = torch.autograd.grad(actual_weighted_ranking_loss_tensor_for_grad,
-                                                       [p for p in model.parameters() if p.requires_grad],
-                                                       retain_graph=True, 
-                                                       allow_unused=True)
-                valid_rank_grads = [g for g in rank_grads_tuple if g is not None]
-                if valid_rank_grads:
-                    flat_rank_grads = torch.cat([g.contiguous().view(-1) for g in valid_rank_grads])
-                    grad_norm_rank_val = torch.norm(flat_rank_grads, p=2).item()
-            
-            total_combined_loss = total_combined_loss + actual_weighted_ranking_loss_tensor_for_grad
-            final_ranking_loss_val = weighted_spearman_loss.item() # Store the unweighted spearman loss
-        # If current_spearman_loss is not a tensor (e.g. from K<2 returning a float, though handled),
-        # then final_ranking_loss_val remains 0.0 and no ranking loss component is added.
+        # base_spearman_loss_terms is per-complex [B]
+        base_spearman_loss_terms = spearman_soft_loss(pred_sig, true_sig, tau=spearman_tau)
+        # mean_base_ranking_loss is L_rank (scalar)
+        mean_base_ranking_loss = (base_spearman_loss_terms * ranking_relevance_weight.squeeze()).mean()
+        base_ranking_loss_for_log = mean_base_ranking_loss.item()
 
-    # Gradients for individual losses are calculated for logging.
-    # Now, compute gradients for the total_combined_loss for the optimizer step.
-    total_combined_loss.backward()
-    optimizer.step()
+        if mean_base_ranking_loss.requires_grad and params: # Ensure params is not empty
+            rank_grads_tuple = torch.autograd.grad(mean_base_ranking_loss, params, retain_graph=True, allow_unused=True)
+            grad_norm_rank_val = calculate_grad_norm_from_tuple(rank_grads_tuple)
+        
+        # --- Dynamic Lambda Calculation ---
+        # Lambda used for THIS step's loss calculation is `current_ranking_lambda` (EMA from previous)
+        lambda_to_use_in_loss = current_ranking_lambda
+        total_combined_loss = total_combined_loss + lambda_to_use_in_loss * mean_base_ranking_loss
+        
+        # Calculate ideal lambda for the *next* step
+        ideal_next_lambda = current_ranking_lambda # Default to current
+        if grad_norm_rank_val > 1e-8 and grad_norm_reg_val > 1e-8: # Both grads are significant
+            ideal_next_lambda = grad_norm_reg_val / grad_norm_rank_val
+        elif grad_norm_reg_val <= 1e-8 and grad_norm_rank_val > 1e-8: # Only ranking loss has gradient
+             ideal_next_lambda = 0.0 # Effectively try to turn off ranking if reg has no gradient pressure
+        # If grad_norm_rank_val is ~0, or both are ~0, ideal_next_lambda remains current_ranking_lambda.
 
-    # Compute grad norm for the combined loss (as it was)
-    grad_norm = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            grad_norm += p.grad.data.norm(2).item() ** 2
-    grad_norm = grad_norm ** 0.5
+        # EMA for the lambda to be returned and used in the next step
+        updated_lambda_for_next_step = lambda_ema_alpha * current_ranking_lambda + \
+                                       (1 - lambda_ema_alpha) * ideal_next_lambda
+        
+        # Cap the updated_lambda to prevent extreme values
+        updated_lambda_for_next_step = max(1e-5, min(10.0, updated_lambda_for_next_step))
+    
+    # else (no ranking loss or K < 2), total_combined_loss is just regression_loss
+    # and updated_lambda_for_next_step remains current_ranking_lambda
 
-    return total_combined_loss.item(), grad_norm, feats.size(0), avg_dockq, regression_loss.item(), final_ranking_loss_val, grad_norm_reg_val, grad_norm_rank_val
+    # Backward pass on the total combined loss
+    if total_combined_loss.requires_grad: # Ensure there's something to backward
+        total_combined_loss.backward()
+        optimizer.step()
+    elif params: # If no grad, but there are params, still call step if optimizer needs it (e.g. Adam with weight decay)
+        optimizer.step()
+
+
+    # Compute grad norm for the final combined loss (for logging)
+    combined_grad_norm = 0.0
+    if params: # Ensure params is not empty
+        for p in params: # Iterate over the same set of parameters
+            if p.grad is not None:
+                combined_grad_norm += p.grad.data.norm(2).item() ** 2
+        combined_grad_norm = combined_grad_norm ** 0.5
+
+    return (total_combined_loss.item() if isinstance(total_combined_loss, torch.Tensor) else float(total_combined_loss), 
+            combined_grad_norm, 
+            feats.size(0), 
+            avg_dockq, 
+            regression_loss.item() if isinstance(regression_loss, torch.Tensor) else float(regression_loss), 
+            base_ranking_loss_for_log, 
+            grad_norm_reg_val, 
+            grad_norm_rank_val, 
+            updated_lambda_for_next_step)
 
 if __name__ == '__main__':
     main()

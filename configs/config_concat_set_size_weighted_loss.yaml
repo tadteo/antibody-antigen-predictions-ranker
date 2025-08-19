@@ -37,3 +37,4 @@ training:
   add_ranking_loss: true      # Whether to add the ranking loss
   spearman_tau: 0.02          # tau for the soft spearman rank loss
   ranking_loss_weight: 0.75   # lambda for the ranking loss
+  lambda_ema_alpha: 0.75    # Smoothing factor for dynamic lambda (0.0 means no smoothing, 1.0 means lambda never changes from initial)

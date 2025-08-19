@@ -7,7 +7,19 @@
 			"path": "../phd_utils"
 		},
 		{
+			"path": "../logs"
+		},
+		{
 			"path": "../abag/output"
+		},
+		{
+			"path": "../AADaM-fork"
+		},
+		{
+			"path": "../../../Database/sabdab"
+		},
+		{
+			"path": "../../../Database/filtered_sabdab_db"
 		}
 	],
 	"settings": {}
