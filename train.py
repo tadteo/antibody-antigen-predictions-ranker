@@ -79,7 +79,7 @@ def fisher_spearman_soft_loss(pred, target, tau=0.2):
     rho_soft = torch.clamp(rho_soft, min=-1.0 + 1e-6, max=1.0 - 1e-6)
     atanh_rho_soft = torch.atanh(rho_soft)
 
-    return atanh_rho_soft # per complex [B], to be minimized (hence 1-rho)
+    return -atanh_rho_soft # per complex [B], to be minimized (hence -athan of rho)
 
 def main():
     # 1) Setup argument parsing

@@ -20,60 +20,115 @@ from statsmodels.stats.outliers_influence import variance_inflation_factor
 # Global DockQ bin edges (keeping the same binning logic)
 BIN_EDGES = [0.0, 0.25, 0.50, 0.75, 1.00]
 NUM_BUCKETS = len(BIN_EDGES) - 1
-
 def load_data(h5_dir):
-    """Load data from H5 files into a pandas DataFrame."""
+    """Load data from H5 files into a pandas DataFrame (robust to missing keys)."""
+    def first_existing(hf, base, keys):
+        """Return (key, dataset) for the first key under base that exists, else (None, None)."""
+        for k in keys:
+            path = f"{base}/{k}"
+            if path in hf:
+                return k, hf[path]
+        return None, None
+
+    def read_scalar(ds):
+        """Read scalar/0-D dataset to Python float safely."""
+        try:
+            v = ds[()]
+            if isinstance(v, np.ndarray):
+                # 0-D array -> scalar
+                v = v.item() if v.shape == () else float(np.asarray(v).squeeze()[0])
+            return float(v)
+        except Exception:
+            return np.nan
+
     rows = []
-    pae_stats_rows = []  # New list for PAE statistics
-    
+    pae_stats_rows = []
+
     for fname in sorted(os.listdir(h5_dir)):
         if not fname.endswith('.h5'):
             continue
         h5_path = os.path.join(h5_dir, fname)
-        with h5py.File(h5_path, 'r') as hf:
-            for complex_id in hf.keys():
-                for sample in hf[complex_id].keys():
-                    dockq = float(hf[f"{complex_id}/{sample}/abag_dockq"][()])
-                    if np.isnan(dockq):
-                        continue
-                    
-                    ptm = float(hf[f"{complex_id}/{sample}/ptm"][()])
-                    iptm = float(hf[f"{complex_id}/{sample}/iptm"][()])
-                    ranking_confidence = float(hf[f"{complex_id}/{sample}/ranking_confidence"][()])
-                    tm_normalized = float(hf[f"{complex_id}/{sample}/tm_normalized_reference"][()])
-                    bucket = np.digitize(dockq, BIN_EDGES, right=False) - 1
-                    
-                    # Get PAE data for statistical analysis
-                    pae_vals = hf[f"{complex_id}/{sample}/interchain_pae_vals"][()]
-                    
-                    # Compute PAE statistics
-                    pae_stats = {
-                        'complex_id': complex_id,
-                        'sample': sample,
-                        'pae_mean': np.mean(pae_vals),
-                        'pae_std': np.std(pae_vals),
-                        'pae_median': np.median(pae_vals),
-                        'pae_min': np.min(pae_vals),
-                        'pae_max': np.max(pae_vals),
-                        'pae_q25': np.percentile(pae_vals, 25),
-                        'pae_q75': np.percentile(pae_vals, 75),
-                        'dockq': dockq,
-                        'tm_normalized': tm_normalized
-                    }
-                    pae_stats_rows.append(pae_stats)
-                    
-                    rows.append({
-                        'complex_id': complex_id,
-                        'sample': sample,
-                        'dockq': dockq,
-                        'ptm': ptm,
-                        'iptm': iptm,
-                        'ranking_confidence': ranking_confidence,
-                        'tm_normalized': tm_normalized,
-                        'bucket': int(bucket)
-                    })
-    
-    return pd.DataFrame(rows), pd.DataFrame(pae_stats_rows)
+        try:
+            with h5py.File(h5_path, 'r') as hf:
+                for complex_id in hf.keys():
+                    grp = hf[complex_id]
+                    for sample in grp.keys():
+                        base = f"{complex_id}/{sample}"
+
+                        # --- robust key lookups ---
+                        _, dockq_ds = first_existing(hf, base, ["abag_dockq", "dockq"])
+                        _, ptm_ds   = first_existing(hf, base, ["ptm"])
+                        _, iptm_ds  = first_existing(hf, base, ["iptm"])
+                        _, rc_ds    = first_existing(hf, base, ["ranking_confidence", "ranking_confidence_af"])
+                        _, tmn_ds   = first_existing(hf, base, ["tm_normalized_reference", "tm_normalized"])
+
+                        # require these to exist
+                        if dockq_ds is None or ptm_ds is None or iptm_ds is None or rc_ds is None or tmn_ds is None:
+                            # skip this sample if anything critical is missing
+                            # (optional) print a short note:
+                            # print(f"[skip missing] {h5_path}:{base}")
+                            continue
+
+                        dockq = read_scalar(dockq_ds)
+                        ptm = read_scalar(ptm_ds)
+                        iptm = read_scalar(iptm_ds)
+                        ranking_confidence = read_scalar(rc_ds)
+                        tm_normalized = read_scalar(tmn_ds)
+
+                        # sanity checks
+                        if any(np.isnan(x) for x in [dockq, ptm, iptm, ranking_confidence, tm_normalized]):
+                            continue
+                        if not (0.0 <= dockq <= 1.0):
+                            continue
+
+                        bucket = int(np.digitize(dockq, BIN_EDGES, right=False) - 1)
+                        bucket = max(0, min(NUM_BUCKETS - 1, bucket))
+
+                        # PAE stats are optional; skip if absent
+                        pae_path = f"{base}/interchain_pae_vals"
+                        pae_vals = None
+                        if pae_path in hf:
+                            try:
+                                pae_vals = np.asarray(hf[pae_path][()], dtype=float).ravel()
+                                if pae_vals.size == 0 or np.any(~np.isfinite(pae_vals)):
+                                    pae_vals = None
+                            except Exception:
+                                pae_vals = None
+
+                        if pae_vals is not None:
+                            pae_stats_rows.append({
+                                'complex_id': complex_id,
+                                'sample': sample,
+                                'pae_mean': float(np.mean(pae_vals)),
+                                'pae_std': float(np.std(pae_vals)),
+                                'pae_median': float(np.median(pae_vals)),
+                                'pae_min': float(np.min(pae_vals)),
+                                'pae_max': float(np.max(pae_vals)),
+                                'pae_q25': float(np.percentile(pae_vals, 25)),
+                                'pae_q75': float(np.percentile(pae_vals, 75)),
+                                'dockq': dockq,
+                                'tm_normalized': tm_normalized
+                            })
+
+                        rows.append({
+                            'complex_id': complex_id,
+                            'sample': sample,
+                            'dockq': dockq,
+                            'ptm': ptm,
+                            'iptm': iptm,
+                            'ranking_confidence': ranking_confidence,
+                            'tm_normalized': tm_normalized,
+                            'bucket': bucket
+                        })
+        except (OSError, KeyError) as e:
+            # Bad/corrupted file or unreadable object table: skip file and keep going
+            print(f"[warn] Skipping file due to error: {h5_path} ({type(e).__name__}: {e})")
+            continue
+
+    df = pd.DataFrame(rows)
+    pae_df = pd.DataFrame(pae_stats_rows)
+    return df, pae_df
+
 
 def plot_feature_distributions(df):
     """Create violin plots for main features."""
@@ -202,7 +257,7 @@ def compute_vif(df):
 
 def main():
     parser = argparse.ArgumentParser(description='Analyze antibody-antigen prediction dataset')
-    parser.add_argument('--h5_dir', default='/proj/berzelius-2021-29/users/x_matta/abag_dataset_processed_with_ptm', help='Directory containing H5 files')
+    parser.add_argument('--h5_dir', default='/proj/berzelius-2021-29/users/x_matta/abag_af3_predictions/new/abag_dataset_new_with_stats_filtered/', help='Directory containing H5 files')
     args = parser.parse_args()
     
     # Create output directory for plots
