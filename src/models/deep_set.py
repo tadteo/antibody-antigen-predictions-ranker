@@ -47,6 +47,17 @@ class DeepSet(nn.Module):
 
     def forward(self, x, lengths):
         # x: [batch_size, complex_size, set_size, input_dim]
+        if not torch.isfinite(x).all():
+            bad = ~torch.isfinite(x)
+            # first bad index in (B,K,N,F)
+            idx = torch.nonzero(bad)[0].tolist()
+            b, k, n, f = idx
+            val = x[b, k, n, f]
+            raise RuntimeError(
+                f"Non-finite feature BEFORE phi: x[{b},{k},{n},{f}]={val}"
+            )
+        
+        
         B, K, N, F = x.shape
         # print(f"x shape: {x.shape}")
         # print(f"lengths shape: {lengths.shape}")

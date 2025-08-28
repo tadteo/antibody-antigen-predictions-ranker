@@ -57,7 +57,12 @@ def process_h5_file(input_path, output_path):
                     # PAE measures the confidence in the predicted structure alignment
                     pae = in_sample_group['interchain_pae_vals'][()]
                     pae_list.append(pae)
-                
+
+                    # Extract the interchain CA distances for this sample
+                    if 'interchain_ca_distances' in in_sample_group.keys():
+                        ca_distances = in_sample_group['interchain_ca_distances'][()]
+                        ca_distances_list.append(ca_distances)
+
                 # Compute statistics across all samples for this complex
                 if pae_list:
                     # Stack all PAE arrays into a matrix: (num_samples, pae_length)
@@ -74,7 +79,23 @@ def process_h5_file(input_path, output_path):
                     out_complex_group.create_dataset('pae_col_mean', data=pae_col_mean)
                     out_complex_group.create_dataset('pae_col_median', data=pae_col_median)
                     out_complex_group.create_dataset('pae_col_std', data=pae_col_std)
-        
+
+                if ca_distances_list:
+                    # Stack all CA distances arrays into a matrix: (num_samples, ca_distances_length)
+                    # Each row represents one prediction sample, each column represents one residue position
+                    ca_distances_matrix = np.stack(ca_distances_list, axis=0)
+                    
+                    # Compute mean, median, and standard deviation across samples for each residue position
+                    # This gives us confidence metrics for each position in the structure
+                    ca_distances_col_mean = np.nanmean(ca_distances_matrix, axis=0)    # Average CA distances across samples for each position
+                    ca_distances_col_median = np.nanmedian(ca_distances_matrix, axis=0) # Median CA distances across samples for each position
+                    ca_distances_col_std = np.nanstd(ca_distances_matrix, axis=0)      # Standard deviation of CA distances across samples for each position
+                    
+                    # Store the computed statistics in the output file
+                    out_complex_group.create_dataset('ca_distances_col_mean', data=ca_distances_col_mean)
+                    out_complex_group.create_dataset('ca_distances_col_median', data=ca_distances_col_median)
+                    out_complex_group.create_dataset('ca_distances_col_std', data=ca_distances_col_std)
+
         return f"Successfully processed {os.path.basename(input_path)}"
     
     except Exception as e:

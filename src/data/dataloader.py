@@ -14,6 +14,17 @@ import torch.nn.functional as F
 from src.data.triangular_positional_encoding import triangular_encode_features
 
 # ==============================================================================
+# Helper functions for distributed training
+# ==============================================================================
+def calculate_local_batch_size(global_batch_size: int, world_size: int = 1) -> int:
+    """Calculate local batch size per rank for distributed training"""
+    return math.ceil(global_batch_size / world_size)
+
+def create_distributed_collate_fn(local_batch_size: int, samples_per_complex: int):
+    """Create collate function with correct local batch size for distributed training"""
+    return partial(pad_collate_fn, batch_size=local_batch_size, samples_per_complex=samples_per_complex)
+
+# ==============================================================================
 # Load our user‐config (e.g. number of models to draw per complex per epoch)
 # ==============================================================================
 with open('configs/config.yaml', 'r') as f:
@@ -69,6 +80,87 @@ def pad_collate_fn(batch, batch_size, samples_per_complex):
       "weight":   weights,       # [B, K]
       "complex_id": complex_ids  # [B, K]
     }
+
+# ==============================================================================
+# DistributedBatchSampler - Wrapper for DDP compatibility
+# ==============================================================================
+class DistributedBatchSampler(torch.utils.data.Sampler):
+    """
+    Wraps a *batch_sampler* that yields a flat list of indices of length B*K.
+    We shard each full batch into per-rank chunks of length local_B*K.
+    If needed, we PAD by repeating head indices so every rank gets the same size.
+    
+    This preserves your WeightedComplexSampler logic while making it DDP-safe.
+    """
+    def __init__(self, base_batch_sampler, *, world_size=None, rank=None,
+                 local_batch_size: int, samples_per_complex: int,
+                 drop_last: bool = False, pad: bool = True):
+        super().__init__(None)
+        
+        # Get distributed parameters
+        try:
+            import torch.distributed as dist
+            if world_size is None:
+                world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+            if rank is None:
+                rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        except ImportError:
+            world_size = 1
+            rank = 0
+            
+        self.base = base_batch_sampler
+        self.world_size = world_size
+        self.rank = rank
+        self.local_B = local_batch_size           # per-rank complexes
+        self.K = samples_per_complex              # samples per complex
+        self.per_rank_need = self.local_B * self.K
+        self.drop_last = drop_last
+        self.pad = pad
+
+        # Optional: forward set_epoch if the base supports it
+        self._has_set_epoch = hasattr(self.base, "set_epoch")
+
+    def set_epoch(self, epoch: int):
+        """Forward epoch setting to base sampler if supported (for reproducibility)"""
+        if self._has_set_epoch:
+            self.base.set_epoch(epoch)
+
+    def __iter__(self):
+        for full_batch in self.base:  # full_batch: List[int], len ≈ B*K
+            want_total = self.per_rank_need * self.world_size
+
+            if len(full_batch) < want_total:
+                if self.pad:
+                    # repeat from the head deterministically to reach want_total
+                    need = want_total - len(full_batch)
+                    cycle_indices = []
+                    for i in range(need):
+                        cycle_indices.append(full_batch[i % len(full_batch)])
+                    full_batch = list(full_batch) + cycle_indices
+                elif self.drop_last:
+                    # drop the tail so it's divisible
+                    keep = (len(full_batch) // self.per_rank_need) * self.per_rank_need
+                    full_batch = full_batch[:keep]
+                else:
+                    # last batch might be smaller → shard unevenly but still yield something
+                    pass
+
+            # ensure length is multiple of per_rank_need for even sharding
+            if len(full_batch) >= want_total:
+                full_batch = full_batch[:want_total]
+
+            # Shard across ranks
+            start = self.rank * self.per_rank_need
+            end = start + self.per_rank_need
+            shard = full_batch[start:end] if start < len(full_batch) else []
+            
+            if shard or not self.drop_last:
+                yield shard
+
+    def __len__(self):
+        """Return number of batches this rank will see"""
+        # Each full batch from base becomes one per-rank batch here
+        return len(self.base)
 
 # ==============================================================================
 # WeightedComplexSampler
@@ -237,12 +329,14 @@ class AntibodyAntigenPAEDataset(Dataset):
                  manifest_csv: str,
                  split: str = "train",
                  feature_transform=None,
-                 feature_centering=False):
+                 feature_centering=False,
+                 use_interchain_ca_distances: bool = False):
         self.df = pd.read_csv(manifest_csv)
         # Filter to only this split
         self.df = self.df[self.df["split"] == split].reset_index(drop=True)
         self.feature_transform = feature_transform
         self.feature_centering = feature_centering
+        self.use_interchain_ca_distances = use_interchain_ca_distances
 
     def __len__(self):
         return len(self.df)
@@ -261,39 +355,94 @@ class AntibodyAntigenPAEDataset(Dataset):
             interchain_indexes_i = original_sample_group["inter_idx"][()]
             interchain_indexes_j = original_sample_group["inter_jdx"][()]
 
+            # Load residue one-letter codes to filter out X residues
+            residue_one_letter = original_sample_group["residue_one_letter"][()]
+            # Convert bytes to strings if needed (HDF5 sometimes stores as bytes)
+            if isinstance(residue_one_letter[0], bytes):
+                residue_one_letter = [res.decode('utf-8') for res in residue_one_letter]
+
+            # Create mask for non-X residues
+            non_x_mask = np.array([res != 'X' for res in residue_one_letter])
+            
+            # Filter interchain pairs: keep only pairs where both residues are not X
+            valid_pair_mask = non_x_mask[interchain_indexes_i] & non_x_mask[interchain_indexes_j]
+
+            interchain_pae_vals_raw = interchain_pae_vals_raw[valid_pair_mask]
+            interchain_indexes_i = interchain_indexes_i[valid_pair_mask]
+            interchain_indexes_j = interchain_indexes_j[valid_pair_mask]
+
+            # Optional: interchain Cα distances aligned by same indices
+            if self.use_interchain_ca_distances and 'interchain_ca_distances' in original_sample_group:
+                interchain_ca_distances_raw = original_sample_group['interchain_ca_distances'][()]
+                interchain_ca_distances_raw = interchain_ca_distances_raw[valid_pair_mask]
+            else:
+                interchain_ca_distances_raw = None
+
+            # Remap indices to account for removed X residues
+            non_x_indices = np.where(non_x_mask)[0]
+            old_to_new_idx = np.full(len(residue_one_letter), -1, dtype=int)
+            old_to_new_idx[non_x_indices] = np.arange(len(non_x_indices))
+            
+            # Remap the indices
+            interchain_indexes_i = old_to_new_idx[interchain_indexes_i]
+            interchain_indexes_j = old_to_new_idx[interchain_indexes_j]
+
+
+
             label = row["label"] # Scalar label for the single sample case
             if not self.feature_centering:
-                # Create a 3xn with the interchain indexes and the interchain pae values
-                feats = np.array([
-                    interchain_indexes_i,
-                    interchain_indexes_j,
-                    interchain_pae_vals_raw
-                ], dtype=np.float32)
+                # Base features: indices and interchain PAE
+                if interchain_ca_distances_raw is not None:
+                    feats = np.array([
+                        interchain_indexes_i,
+                        interchain_indexes_j,
+                        interchain_pae_vals_raw,
+                        interchain_ca_distances_raw,
+                    ], dtype=np.float32)
+                else:
+                    feats = np.array([
+                        interchain_indexes_i,
+                        interchain_indexes_j,
+                        interchain_pae_vals_raw
+                    ], dtype=np.float32)
             else:
                 pae_col_mean = hf[complex_id]["pae_col_mean"][()]
+                pae_col_mean = pae_col_mean[valid_pair_mask]
+
                 # pae_col_std = hf[complex_id]["pae_col_std"][()] # Not currently used for centering
                 interchain_pae_vals_centered = interchain_pae_vals_raw - pae_col_mean
-                feats = np.array([
-                    interchain_indexes_i,
-                    interchain_indexes_j,
-                    pae_col_mean,
-                    interchain_pae_vals_centered,
-                ], dtype=np.float32)
+                # If interchain ca distances are available, add them to the features
+                if interchain_ca_distances_raw is not None:
+                    feats = np.array([
+                        interchain_indexes_i,
+                        interchain_indexes_j,
+                        pae_col_mean,
+                        interchain_pae_vals_centered,
+                        interchain_ca_distances_raw,
+                    ], dtype=np.float32)
+                else:
+                    feats = np.array([
+                        interchain_indexes_i,
+                        interchain_indexes_j,
+                        pae_col_mean,
+                        interchain_pae_vals_centered,
+                    ], dtype=np.float32)
             
-            
+        
+        
         # Optional user‐provided transform (applies to feats)
         if self.feature_transform:
             feats = self.feature_transform(feats)
         
         # Transform label(s) using clipped logit - works element-wise if label is an array
         # print(f"label before: {label}")
-        epsilon = 1e-8
+        epsilon = 1e-6
         label = np.clip(label, epsilon, 1 - epsilon)
         label = np.log(label / (1 - label))
         
 
         return {
-            "features": torch.from_numpy(feats),            # [3 or 4, n]
+            "features": torch.from_numpy(feats),            # [3..5, n]
             "label":    torch.tensor(label, dtype=torch.float32), # DockQ (logit transformed)
             "weight":   torch.tensor(row["weight"]),         # importance weight
             "length":   torch.tensor(len(feats[0])),         # length of the sample
@@ -311,19 +460,26 @@ def get_eval_dataloader(manifest_csv: str,
                         samples_per_complex: int = None,
                         feature_transform: bool = False,
                         feature_centering: bool = False,
-                        seed: int = None):
+                        use_interchain_ca_distances: bool = False,
+                        seed: int = None,
+                        distributed: bool = False,
+                        world_size: int = 1,
+                        rank: int = 0):
     """
     DataLoader for evaluation: sequential (no shuffle), no special sampling.
+    For distributed training, wraps with DistributedBatchSampler.
     """
     if feature_transform:
         print("Val dataloader: Using triangular positional encoding")
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering, use_interchain_ca_distances=use_interchain_ca_distances)
     else:
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_ca_distances=use_interchain_ca_distances)
     
-    collate = partial(pad_collate_fn, batch_size=batch_size, samples_per_complex=samples_per_complex)
+    # Calculate local batch size for distributed training
+    local_batch_size = calculate_local_batch_size(batch_size, world_size) if distributed else batch_size
+    collate = create_distributed_collate_fn(local_batch_size, samples_per_complex)
 
-    sampler = WeightedComplexSampler(
+    base_sampler = WeightedComplexSampler(
             dataset,
             samples_per_complex=samples_per_complex,
             batch_size=batch_size,
@@ -331,6 +487,21 @@ def get_eval_dataloader(manifest_csv: str,
             replacement=True,
             seed=seed
         )
+    
+    # Wrap with distributed sampler if needed (validation typically doesn't drop_last)
+    if distributed:
+        sampler = DistributedBatchSampler(
+            base_sampler,
+            world_size=world_size,
+            rank=rank,
+            local_batch_size=local_batch_size,
+            samples_per_complex=samples_per_complex,
+            drop_last=False,  # Keep all validation data
+            pad=True  # Ensure same number of steps across ranks
+        )
+    else:
+        sampler = base_sampler
+        
     return DataLoader(dataset,
                       batch_sampler=sampler,
                       num_workers=num_workers,
@@ -349,26 +520,37 @@ def get_dataloader(manifest_csv: str,
                    bucket_balance: bool = False,
                    feature_transform: bool = False,
                    feature_centering: bool = False,
-                   seed: int = None):
+                   use_interchain_ca_distances: bool = False,
+                   seed: int = None,
+                   distributed: bool = False,
+                   world_size: int = 1,
+                   rank: int = 0):
     """
     Priority of sampling strategies:
       1) If both samples_per_complex and bucket_balance → use WeightedPerComplexSampler
       2) If samples_per_complex only     → use PerComplexSampler (uniform within complex)
       3) If bucket_balance only          → use WeightedRandomSampler (global)
       4) Else                            → plain shuffle
+      
+    For distributed training:
+      - Wraps the base sampler with DistributedBatchSampler
+      - Calculates local_batch_size per rank
+      - Uses appropriate collate function
     """
     if feature_transform:
         print("Train dataloader: Using triangular positional encoding")
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering, use_interchain_ca_distances=use_interchain_ca_distances)
     else:
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_ca_distances=use_interchain_ca_distances)
 
-    collate = partial(pad_collate_fn, batch_size=batch_size, samples_per_complex=samples_per_complex)
+    # Calculate local batch size for distributed training
+    local_batch_size = calculate_local_batch_size(batch_size, world_size) if distributed else batch_size
+    collate = create_distributed_collate_fn(local_batch_size, samples_per_complex)
 
     # Case 1: both constraints
     if samples_per_complex is not None and bucket_balance:
         print(f"Using WeightedPerComplexSampler with samples_per_complex={samples_per_complex}, batch_size={batch_size}")
-        sampler = WeightedComplexSampler(
+        base_sampler = WeightedComplexSampler(
             dataset,
             samples_per_complex=samples_per_complex,
             batch_size=batch_size,
@@ -376,6 +558,21 @@ def get_dataloader(manifest_csv: str,
             replacement=True,
             seed=seed
         )
+        
+        # Wrap with distributed sampler if needed
+        if distributed:
+            sampler = DistributedBatchSampler(
+                base_sampler,
+                world_size=world_size,
+                rank=rank,
+                local_batch_size=local_batch_size,
+                samples_per_complex=samples_per_complex,
+                drop_last=True,
+                pad=True
+            )
+        else:
+            sampler = base_sampler
+            
         return DataLoader(dataset,
                           batch_sampler=sampler,
                           num_workers=num_workers,
@@ -385,7 +582,7 @@ def get_dataloader(manifest_csv: str,
     # Case 2: uniform per complex
     if samples_per_complex is not None and bucket_balance is False:
         print(f"Using PerComplexSampler with samples_per_complex={samples_per_complex}, batch_size={batch_size}")
-        sampler = WeightedComplexSampler(
+        base_sampler = WeightedComplexSampler(
             dataset,
             samples_per_complex=samples_per_complex,
             batch_size=batch_size,
@@ -393,6 +590,21 @@ def get_dataloader(manifest_csv: str,
             replacement=True,
             seed=seed
         )
+        
+        # Wrap with distributed sampler if needed
+        if distributed:
+            sampler = DistributedBatchSampler(
+                base_sampler,
+                world_size=world_size,
+                rank=rank,
+                local_batch_size=local_batch_size,
+                samples_per_complex=samples_per_complex,
+                drop_last=True,
+                pad=True
+            )
+        else:
+            sampler = base_sampler
+            
         return DataLoader(dataset,
                           batch_sampler=sampler,
                           num_workers=num_workers,
@@ -401,14 +613,29 @@ def get_dataloader(manifest_csv: str,
 
     if samples_per_complex is None:
         print(f"Using WeightedRandomSampler with block length {batch_size}")
-        sampler = WeightedPerComplexSampler(
+        base_sampler = WeightedComplexSampler(
             dataset,
-            samples_per_complex=samples_per_complex,
+            samples_per_complex=1,  # Default to 1 if not specified
             batch_size=batch_size,
             weighted=False,
             replacement=True,
             seed=seed
         )
+        
+        # Wrap with distributed sampler if needed
+        if distributed:
+            sampler = DistributedBatchSampler(
+                base_sampler,
+                world_size=world_size,
+                rank=rank,
+                local_batch_size=local_batch_size,
+                samples_per_complex=1,
+                drop_last=True,
+                pad=True
+            )
+        else:
+            sampler = base_sampler
+            
         return DataLoader(dataset,
                           batch_sampler=sampler,
                           num_workers=num_workers,

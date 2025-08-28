@@ -104,6 +104,7 @@ def main():
     epochs = epochs * actual_number_of_epochs
 
     # dataloaders: use uniform sampling (no bucket_balance)
+    use_interchain_ca_distances = cfg['data'].get('use_interchain_ca_distances', False)
     if args.focus == 'none' or args.focus == 'low_dockq':
         train_loader = get_dataloader(
             focused_csv, 'train', batch_size=batch_size,
@@ -111,6 +112,7 @@ def main():
             samples_per_complex=samples_per_complex,
             bucket_balance=False,
             feature_transform=cfg['data']['feature_transform'],
+            use_interchain_ca_distances=use_interchain_ca_distances,
             seed=cfg['training'].get('seed', None)
         )
     elif args.focus == 'high_variance':
@@ -120,19 +122,22 @@ def main():
             samples_per_complex=samples_per_complex,
             bucket_balance=True,
             feature_transform=cfg['data']['feature_transform'],
+            use_interchain_ca_distances=use_interchain_ca_distances,
             seed=cfg['training'].get('seed', None)
         )
     val_loader = get_eval_dataloader(
         args.manifest_csv, 'val', batch_size=batch_size,
         num_workers=num_workers,
         feature_transform=cfg['data']['feature_transform'],
+        use_interchain_ca_distances=use_interchain_ca_distances,
         seed=cfg['training'].get('seed', None)
     )
 
     # model setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Use input_dim from config; ensure it matches dataloader feature channels
     model = DeepSet(
-        cfg['model']['input_dim'],
+        int(cfg['model']['input_dim']),
         cfg['model']['phi_hidden_dims'],
         cfg['model']['rho_hidden_dims'],
         aggregator=cfg['model']['aggregator']

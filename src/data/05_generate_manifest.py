@@ -126,36 +126,57 @@ def build_manifest(h5_dir, val_frac, test_frac, seed, out_csv, weight_strategy):
         complex_stats.loc[complex_stats['strata'].isin(small), 'strata'] = 'other'
     
     # 5) Perform splits, with fallback to mean‐only if needed
-    try:
-        # first test split
-        train_val, test = train_test_split(
-            complex_stats,
-            test_size=test_frac,
-            stratify=complex_stats['strata'],
-            random_state=seed
-        )
-        # then train/val split
-        train, val = train_test_split(
-            train_val,
-            test_size=val_frac/(1-test_frac),
-            stratify=train_val['strata'],
-            random_state=seed
-        )
-    except ValueError:
-        # fallback: stratify only on mean_bin
-        print("WARNING: joint mean+std stratification failed; falling back to mean‐only stratification")
-        train_val, test = train_test_split(
-            complex_stats,
-            test_size=test_frac,
-            stratify=complex_stats['mean_bin'],
-            random_state=seed
-        )
-        train, val = train_test_split(
-            train_val,
-            test_size=val_frac/(1-test_frac),
-            stratify=train_val['mean_bin'],
-            random_state=seed
-        )
+    if test_frac and test_frac > 0.0:
+        try:
+            # first test split
+            train_val, test = train_test_split(
+                complex_stats,
+                test_size=test_frac,
+                stratify=complex_stats['strata'],
+                random_state=seed
+            )
+            # then train/val split
+            train, val = train_test_split(
+                train_val,
+                test_size=val_frac/(1-test_frac),
+                stratify=train_val['strata'],
+                random_state=seed
+            )
+        except ValueError:
+            # fallback: stratify only on mean_bin
+            print("WARNING: joint mean+std stratification failed; falling back to mean‐only stratification")
+            train_val, test = train_test_split(
+                complex_stats,
+                test_size=test_frac,
+                stratify=complex_stats['mean_bin'],
+                random_state=seed
+            )
+            train, val = train_test_split(
+                train_val,
+                test_size=val_frac/(1-test_frac),
+                stratify=train_val['mean_bin'],
+                random_state=seed
+            )
+    else:
+        # No test split requested; create empty test set and only split train/val
+        print("No test split requested (test_frac=0). Performing only train/val split.")
+        try:
+            train, val = train_test_split(
+                complex_stats,
+                test_size=val_frac,
+                stratify=complex_stats['strata'],
+                random_state=seed
+            )
+        except ValueError:
+            print("WARNING: joint mean+std stratification failed; falling back to mean‐only stratification")
+            train, val = train_test_split(
+                complex_stats,
+                test_size=val_frac,
+                stratify=complex_stats['mean_bin'],
+                random_state=seed
+            )
+        # empty DataFrame with same columns as complex_stats
+        test = complex_stats.iloc[0:0].copy()
     
     # 6) Map splits back onto the full df
     split_map = (
@@ -196,7 +217,10 @@ def build_manifest(h5_dir, val_frac, test_frac, seed, out_csv, weight_strategy):
         # make an explicit copy to avoid SettingWithCopyWarning
         sub_df = df[df['split']==split].copy()
 
-        if weight_strategy == 'bucket':
+        if sub_df.empty:
+            # Nothing to weight in this split
+            continue
+        elif weight_strategy == 'bucket':
             # original bucket‐based weighting
             sub_df['bucket'] = np.digitize(sub_df['label'], BIN_EDGES, right=False) - 1  # Create bucket column first
             bucket_counts = sub_df['bucket'].value_counts().to_dict()
@@ -248,11 +272,11 @@ def parse_args():
                    help='Directory of complex subfolders containing .h5 files')
     p.add_argument('--val_frac', type=float, default=0.1,
                    help='Fraction for validation split')
-    p.add_argument('--test_frac', type=float, default=0.1,
+    p.add_argument('--test_frac', type=float, default=0.0,
                    help='Fraction for test split')
     p.add_argument('--seed', type=int, default=42,
                    help='Random seed for reproducibility')
-    p.add_argument('--out_csv', default='data/manifest_new_filtered_pae_centered.csv',
+    p.add_argument('--out_csv', default='data/manifest_new_with_distance_filtered_pae_centered.csv',
                    help='Output path for manifest CSV')
     p.add_argument('--weight_strategy', choices=['bucket','uniform','density','density_with_clipping'], default='density_with_clipping',
                    help='Strategy for sample weights: bucket or uniform')

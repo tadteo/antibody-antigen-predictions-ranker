@@ -13,3 +13,4 @@ statsmodels>=0.13.0
 DockQ
 tmtools
 biotite
+lightning

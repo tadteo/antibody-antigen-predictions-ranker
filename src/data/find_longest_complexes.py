@@ -10,7 +10,7 @@ import csv
 import os # Added for path manipulation
 
 # Path to the input CSV file
-input_csv_file_path = "/proj/berzelius-2021-29/users/x_matta/antibody-antigen-predictions-ranker/data/manifest_new_filtered_pae_centered_density_with_clipping.csv"
+input_csv_file_path = "/proj/berzelius-2021-29/users/x_matta/antibody-antigen-predictions-ranker/data/manifest_new_with_distance_filtered_pae_centered_density_with_clipping.csv"
 # Determine the output file path in the same directory as the input
 base_name_without_ext, ext = os.path.splitext(os.path.basename(input_csv_file_path))
 output_filename = f"{base_name_without_ext}_500k_maxlen{ext}"

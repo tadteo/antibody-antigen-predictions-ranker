@@ -1,0 +1,42 @@
+data:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  processed_file: processed_data.h5
+  splits_dir: data/raw_splits
+  manifest_file: data/manifest_new_with_distance_filtered_pae_centered_density_with_clipping_500k_maxlen.csv
+  feature_transform: true
+  feature_centering: true
+  batch_size: 2 #8 max batch for sum aggregators #6 max batch for concat_stats aggregator #4 max batch for attn_pool aggregator
+  num_workers: 8
+  samples_per_complex: 5
+  use_interchain_ca_distances: true
+  
+model:
+  input_dim: 4
+  aggregator: concat_stats_by_set_size
+  phi_hidden_dims: [128, 32, 64]
+  rho_hidden_dims: [256, 256, 256]
+
+training:
+  adaptive_weight: true
+  epochs: 150
+  lr: !!float 1e-3
+  weight_decay: !!float 1e-5
+  smooth_l1_beta: 0.5
+  weighted_loss: true
+  bucket_balance: false
+  num_buckets: 4
+  seed: 42
+  lr_scheduler_type: "OneCycleLR"  # or "ReduceLROnPlateau"
+  lr_scheduler_factor: 0.75
+  lr_scheduler_patience: 5
+  min_lr: !!float 1e-6
+  onecycle_max_lr: !!float 5e-3         # Only used if lr_scheduler_type is OneCycleLR
+  onecycle_pct_start: 0.3       # Only used if lr_scheduler_type is OneCycleLR
+  onecycle_div_factor: 10.0     # Only used if lr_scheduler_type is OneCycleLR
+  onecycle_final_div_factor: !!float 1000 # Only used if lr_scheduler_type is OneCycleLR
+  add_ranking_loss: true      # Whether to add the ranking loss
+  spearman_tau: 0.05          # tau for the soft spearman rank loss
+  ranking_loss_weight: 0.75   # lambda for the ranking loss
+  lambda_ema_alpha: 0.85    # Smoothing factor for dynamic lambda (0.0 means no smoothing, 1.0 means lambda never changes from initial)
+  ranking_loss_start_epoch: 10 
