@@ -11,7 +11,9 @@ import os
 import yaml
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
+from torch.distributions import Beta
 import wandb
 from dotenv import load_dotenv
 import time
