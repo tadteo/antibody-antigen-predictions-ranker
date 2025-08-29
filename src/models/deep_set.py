@@ -41,11 +41,24 @@ class DeepSet(nn.Module):
             rho_layers.append(nn.ReLU())
             rho_layers.append(nn.Dropout(0.1))
             prev_dim = h
-        rho_layers.append(nn.Linear(prev_dim, output_dim))
-        #No sigmoid here because we want to use Huber loss and it will choke the gradient 
+        
+        # rho_layers.append(nn.Linear(prev_dim, output_dim))
+        # #No sigmoid here because we want to use Huber loss and it will choke the gradient 
+        # self.rho = nn.Sequential(*rho_layers)
+
+        # Final layer now outputs TWO values: z_mu, z_k
+        rho_layers.append(nn.Linear(prev_dim, 2))
         self.rho = nn.Sequential(*rho_layers)
 
     def forward(self, x, lengths):
+        """
+        Args:
+            x: [B, K, N, F]
+            lengths: [B, K] true lengths per sample
+        Returns:
+            z_mu, z_k : raw outputs for mean and concentration, shape [B, K]
+        """
+
         # x: [batch_size, complex_size, set_size, input_dim]
         if not torch.isfinite(x).all():
             bad = ~torch.isfinite(x)
@@ -167,9 +180,13 @@ class DeepSet(nn.Module):
         # print(f"agg shape after aggregation and normalization: {agg.shape}")
 
         # Rho network
-        out = self.rho(agg)   # [B, K, output_dim]
-        # print(f"out shape: {out.shape}")
-        return out.squeeze(-1)
+        # out = self.rho(agg)   # [B, K, output_dim]
+        # # print(f"out shape: {out.shape}")
+        # return out.squeeze(-1)
+
+        out = self.rho(agg)   # [B, K, 2]
+        z_mu, z_k = out[...,0], out[...,1]
+        return z_mu, z_k   # raw outputs, apply Beta transform in loss
 
 def init_weights(module):
     """

@@ -31,7 +31,7 @@ training:
   lr_scheduler_factor: 0.75
   lr_scheduler_patience: 5
   min_lr: !!float 1e-6
-  onecycle_max_lr: !!float 5e-3         # Only used if lr_scheduler_type is OneCycleLR
+  onecycle_max_lr: !!float 2e-3         # Only used if lr_scheduler_type is OneCycleLR
   onecycle_pct_start: 0.3       # Only used if lr_scheduler_type is OneCycleLR
   onecycle_div_factor: 10.0     # Only used if lr_scheduler_type is OneCycleLR
   onecycle_final_div_factor: !!float 1000 # Only used if lr_scheduler_type is OneCycleLR

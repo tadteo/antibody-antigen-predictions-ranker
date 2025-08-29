@@ -436,9 +436,12 @@ class AntibodyAntigenPAEDataset(Dataset):
         
         # Transform label(s) using clipped logit - works element-wise if label is an array
         # print(f"label before: {label}")
-        epsilon = 1e-6
-        label = np.clip(label, epsilon, 1 - epsilon)
-        label = np.log(label / (1 - label))
+        # epsilon = 1e-6
+        # label = np.clip(label, epsilon, 1 - epsilon)
+        # label = np.log(label / (1 - label))
+        
+        epsilon = 1e-4
+        label = float(np.clip(label, epsilon, 1 - epsilon))
         
 
         return {

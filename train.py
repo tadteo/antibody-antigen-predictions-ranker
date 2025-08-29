@@ -31,6 +31,26 @@ from src.models.deep_set import DeepSet, init_weights
 
 torch.set_float32_matmul_precision("high")
 
+def beta_regression_loss(y_true, z_mu, z_k, T=3.0, eps=1e-3):
+    """
+    y_true: [B, K] in [0,1]
+    z_mu, z_k: [B, K] raw outputs from model
+    Returns: (loss_scalar, mu, kappa)
+    """
+    # Predict mean μ in (eps, 1-eps) using a temperatured sigmoid (flatter near edges)
+    mu = eps + (1 - 2*eps) * torch.sigmoid(z_mu / T)
+    # Predict concentration κ > 0
+    kappa = 1.0 + F.softplus(z_k)
+
+    alpha = mu * kappa
+    beta  = (1 - mu) * kappa
+
+    y = y_true.clamp(eps, 1 - eps)  # avoid log(0) at exact edges
+    dist = Beta(alpha, beta)
+    nll = -dist.log_prob(y)         # [B, K]
+    # mean over K then B (like your current reduction); adjust if you weight per-sample
+    return nll.mean(), mu, kappa
+
 def pairwise_soft_rank(scores, tau=0.1):
     """
     scores : Tensor [..., K]
@@ -386,7 +406,7 @@ def main():
     #phi_hidden_dims and rho_hiddens_dims to string
     phi_hidden_dims_str = '_'.join(str(dim) for dim in phi_hidden_dims)
     rho_hidden_dims_str = '_'.join(str(dim) for dim in rho_hidden_dims)
-    name = f"DeepSet_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_weighted_loss_{weighted_loss}_aggregator_{aggregator}_lr_scheduler_{learning_rate_scheduler_str}"
+    name = f"DeepSet_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_betadist_loss_{weighted_loss}_aggregator_{aggregator}_lr_scheduler_{learning_rate_scheduler_str}"
 
     # run_id = os.getenv("SLURM_JOB_ID", "local")
     # Initialize W&B run (only on rank 0)
@@ -685,22 +705,28 @@ def run_validation(model, val_loader, base_criterion, device, weighted_loss,
             weights= batch['weight'].to(device)  # still available
             complex_id = batch['complex_id']
 
-            logits = model(feats, lengths)
-            logits = torch.clamp(logits, min=-100.0, max=100.0)
+            # logits = model(feats, lengths)
+            # logits = torch.clamp(logits, min=-100.0, max=100.0)
             
-            # =============== REGRESSION LOSS ===============
-            regression_losses = base_criterion(logits, labels)
-            if weighted_loss:
-                regression_loss = (regression_losses * weights).mean()
-            else:
-                regression_loss = regression_losses.mean()
+            # # =============== REGRESSION LOSS ===============
+            # regression_losses = base_criterion(logits, labels)
+            # if weighted_loss:
+            #     regression_loss = (regression_losses * weights).mean()
+            # else:
+            #     regression_loss = regression_losses.mean()
             
+            z_mu, z_k = model(feats, lengths)
+            regression_loss, mu, kappa = beta_regression_loss(labels, z_mu, z_k, T=3.0, eps=1e-3)
+
             # =============== RANKING LOSS (if enabled) ===============
             base_ranking_loss = 0.0
-            if add_ranking_loss and logits.size(1) > 1:
-                pred_sig = torch.sigmoid(logits)
-                true_sig = torch.sigmoid(labels)
-                
+            # if add_ranking_loss and logits.size(1) > 1:
+            #     pred_sig = torch.sigmoid(logits)
+            #     true_sig = torch.sigmoid(labels)
+            if add_ranking_loss and mu.size(1) > 1:
+                pred_sig = mu
+                true_sig = labels
+
                 # Compute ranking relevance weight (same as training)
                 with torch.no_grad():
                     true_sig_std = true_sig.std(dim=1, keepdim=True) + 1e-6
@@ -711,7 +737,9 @@ def run_validation(model, val_loader, base_criterion, device, weighted_loss,
             
             # =============== COMBINED LOSS ===============
             combined_loss = regression_loss
-            if add_ranking_loss and logits.size(1) > 1:
+            # if add_ranking_loss and logits.size(1) > 1:
+            #     combined_loss = combined_loss + current_ranking_lambda * base_ranking_loss
+            if add_ranking_loss and mu.size(1) > 1:
                 combined_loss = combined_loss + current_ranking_lambda * base_ranking_loss
             
             # =============== AVERAGE DOCKQ ===============
@@ -727,15 +755,19 @@ def run_validation(model, val_loader, base_criterion, device, weighted_loss,
 
             # convert back labels and logits to 0-1 for metrics
             # Labels are already logit transformed, so apply sigmoid to convert back for comparison
-            labels_original_scale = torch.sigmoid(labels)
-            logits_original_scale = torch.sigmoid(logits)
+            # labels_original_scale = torch.sigmoid(labels)
+            # logits_original_scale = torch.sigmoid(logits)
 
-            #clipping for extreme sigmoid outputs
-            labels_original_scale = torch.clamp(labels_original_scale, min=1e-7, max=1-1e-7)
-            logits_original_scale = torch.clamp(logits_original_scale, min=1e-7, max=1-1e-7)
+            # #clipping for extreme sigmoid outputs
+            # labels_original_scale = torch.clamp(labels_original_scale, min=1e-7, max=1-1e-7)
+            # logits_original_scale = torch.clamp(logits_original_scale, min=1e-7, max=1-1e-7)
             
-            val_preds.extend(logits_original_scale.cpu().numpy().flatten())
-            val_labels.extend(labels_original_scale.cpu().numpy().flatten())
+            # val_preds.extend(logits_original_scale.cpu().numpy().flatten())
+            # val_labels.extend(labels_original_scale.cpu().numpy().flatten())
+
+            # metrics: μ is already in 0-1, labels already in 0-1
+            val_preds.extend(mu.detach().cpu().numpy().flatten())
+            val_labels.extend(labels.cpu().numpy().flatten())
 
     # Average the losses
     avg_val_loss = val_loss / len(val_loader)
@@ -822,34 +854,47 @@ def train_step(model, batch, optimizer, base_criterion, device,
     # ------------------- forward + base losses -------------------
     def compute_losses():
                    
-        logits = model(feats, lengths)  # [B, K] predictions in logit space
+        # logits = model(feats, lengths)  # [B, K] predictions in logit space
 
-        # regression loss on logits vs labels (already in logit space)
-        regression_losses = base_criterion(logits, labels)
+        # # regression loss on logits vs labels (already in logit space)
+        # regression_losses = base_criterion(logits, labels)
 
-        current_regression_weights = weights
-        if adaptive_weight:
-            with torch.no_grad():
-                # focus more on extremes (DockQ near 0 or 1)
-                conf_w = 1.0 + 4.0 * ((torch.sigmoid(labels) < 0.1) | (torch.sigmoid(labels) > 0.9))
-                current_regression_weights = current_regression_weights * conf_w
+        # current_regression_weights = weights
+        # if adaptive_weight:
+        #     with torch.no_grad():
+        #         # focus more on extremes (DockQ near 0 or 1)
+        #         conf_w = 1.0 + 4.0 * ((torch.sigmoid(labels) < 0.1) | (torch.sigmoid(labels) > 0.9))
+        #         current_regression_weights = current_regression_weights * conf_w
 
-        if weighted_loss:
-            regression_loss = (regression_losses * current_regression_weights).mean()
-        else:
-            regression_loss = regression_losses.mean()
+        # if weighted_loss:
+        #     regression_loss = (regression_losses * current_regression_weights).mean()
+        # else:
+        #     regression_loss = regression_losses.mean()
 
-        return logits, regression_loss, current_regression_weights
+        # return logits, regression_loss, current_regression_weights
+        z_mu, z_k = model(feats, lengths)  # each [B, K]
+        # Beta NLL (returns scalar), also returns μ in [0,1] and κ>0
+        regression_loss, mu, kappa = beta_regression_loss(labels, z_mu, z_k, T=3.0, eps=1e-3)
+
+        # If you need per-sample weighting, compute per-sample NLL (mean over K, not reduced):
+        # nll = -Beta(mu*kappa, (1-mu)*kappa).log_prob(labels.clamp(1e-3, 1-1e-3))  # [B,K]
+        # regression_loss = (nll.mean(dim=1) * weights).mean() if weighted_loss else nll.mean()
+
+        return (mu, regression_loss)  # return μ for ranking and logging
+
 
     with autocast_ctx:
-        logits, regression_loss, current_regression_weights = compute_losses()
+        mu, regression_loss = compute_losses()
 
         # Optional ranking loss (Spearman-soft) if K > 1
         base_ranking_loss_for_log = 0.0
         mean_base_ranking_loss = None
-        if add_ranking_loss and logits.size(1) > 1:
-            pred_sig = torch.sigmoid(logits)
-            true_sig = torch.sigmoid(labels)
+        # if add_ranking_loss and logits.size(1) > 1:
+        #     pred_sig = torch.sigmoid(logits)
+        #     true_sig = torch.sigmoid(labels)
+        if add_ranking_loss and mu.size(1) > 1:
+            pred_sig = mu
+            true_sig = labels
             with torch.no_grad():
                 true_sig_std = true_sig.std(dim=1, keepdim=True) + 1e-6
                 ranking_relevance_weight = torch.clamp(true_sig_std / 0.07, min=0.0, max=1.0)
@@ -898,7 +943,7 @@ def train_step(model, batch, optimizer, base_criterion, device,
     # ------------------- final combined backward + step -------------------
     # Build the combined loss using the *current* lambda (as in your code)
     total_combined_loss = regression_loss
-    if add_ranking_loss and logits.size(1) > 1:
+    if add_ranking_loss and mu.size(1) > 1:
         total_combined_loss = total_combined_loss + current_ranking_lambda * mean_base_ranking_loss
 
     optimizer.zero_grad(set_to_none=True)
