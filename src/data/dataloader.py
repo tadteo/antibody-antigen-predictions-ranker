@@ -41,6 +41,8 @@ def pad_collate_fn(batch, batch_size, samples_per_complex):
     weights = torch.tensor([b["weight"] for b in batch])   # (B·K,)
     lengths = torch.tensor([b["length"] for b in batch])   # (B·K,)
     complex_ids = [b["complex_id"] for b in batch]         # list of str
+    ranking_score = torch.tensor([b["ranking_score"] for b in batch])   # (B·K,)
+    ranking_score = ranking_score.reshape(batch_size, samples_per_complex)
 
     max_n   = max(lengths)
     
@@ -82,7 +84,8 @@ def pad_collate_fn(batch, batch_size, samples_per_complex):
       "lengths":  lengths,       # [B, K]
       "label":    labels,        # [B, K]
       "weight":   weights,       # [B, K]
-      "complex_id": complex_ids  # [B, K]
+      "complex_id": complex_ids,  # [B, K]
+      "ranking_score": ranking_score  # [B, K]
     }
 
 # ==============================================================================
@@ -322,6 +325,7 @@ class PerComplexSequentialSampler(torch.utils.data.Sampler):
     def __init__(self, dataset, batch_size: int, samples_per_complex: int):
         self.df = dataset.df                      # already split='val'
         self.batch_size = batch_size              # B
+        print(f"the batch size for the validation sampler is {self.batch_size}")
         self.K = samples_per_complex              # K
 
         # Complexes in manifest order (no shuffle)
@@ -343,6 +347,7 @@ class PerComplexSequentialSampler(torch.utils.data.Sampler):
 
         # Batch chunks deterministically into size B; drop if last batch is smaller than B
         self.batches = []
+        print(f"the batch size for the validation sampler is {self.batch_size}")
         for i in range(0, len(self.chunks), self.batch_size):
             batch_chunks = self.chunks[i:i+self.batch_size]
             flat = [idx for ch in batch_chunks for idx in ch]
@@ -378,12 +383,14 @@ class AntibodyAntigenPAEDataset(Dataset):
                  split: str = "train",
                  feature_transform=None,
                  feature_centering=False,
+                 use_interchain_pae: bool = True,
                  use_interchain_ca_distances: bool = False):
         self.df = pd.read_csv(manifest_csv)
         # Filter to only this split
         self.df = self.df[self.df["split"] == split].reset_index(drop=True)
         self.feature_transform = feature_transform
         self.feature_centering = feature_centering
+        self.use_interchain_pae = use_interchain_pae
         self.use_interchain_ca_distances = use_interchain_ca_distances
 
     def __len__(self):
@@ -402,7 +409,7 @@ class AntibodyAntigenPAEDataset(Dataset):
             interchain_pae_vals_raw = original_sample_group["interchain_pae_vals"][()]
             interchain_indexes_i = original_sample_group["inter_idx"][()]
             interchain_indexes_j = original_sample_group["inter_jdx"][()]
-
+            ranking_score = original_sample_group["ranking_score"][()]
             # Load residue one-letter codes to filter out X residues
             residue_one_letter = original_sample_group["residue_one_letter"][()]
             # Convert bytes to strings if needed (HDF5 sometimes stores as bytes)
@@ -418,6 +425,9 @@ class AntibodyAntigenPAEDataset(Dataset):
             interchain_pae_vals_raw = interchain_pae_vals_raw[valid_pair_mask]
             interchain_indexes_i = interchain_indexes_i[valid_pair_mask]
             interchain_indexes_j = interchain_indexes_j[valid_pair_mask]
+
+            if not self.use_interchain_pae:
+                interchain_pae_vals_raw = None
 
             # Optional: interchain Cα distances aligned by same indices
             if self.use_interchain_ca_distances and 'interchain_ca_distances' in original_sample_group:
@@ -438,43 +448,50 @@ class AntibodyAntigenPAEDataset(Dataset):
 
 
             label = row["label"] # Scalar label for the single sample case
-            if not self.feature_centering:
-                # Base features: indices and interchain PAE
-                if interchain_ca_distances_raw is not None:
-                    feats = np.array([
-                        interchain_indexes_i,
-                        interchain_indexes_j,
-                        interchain_pae_vals_raw,
-                        interchain_ca_distances_raw,
-                    ], dtype=np.float32)
+            if interchain_pae_vals_raw is not None:
+                if not self.feature_centering:
+                    # Base features: indices and interchain PAE
+                    if interchain_ca_distances_raw is not None:
+                        feats = np.array([
+                            interchain_indexes_i,
+                            interchain_indexes_j,
+                            interchain_pae_vals_raw,
+                            interchain_ca_distances_raw,
+                        ], dtype=np.float32)
+                    else:
+                        feats = np.array([
+                            interchain_indexes_i,
+                            interchain_indexes_j,
+                            interchain_pae_vals_raw
+                        ], dtype=np.float32)
                 else:
-                    feats = np.array([
-                        interchain_indexes_i,
-                        interchain_indexes_j,
-                        interchain_pae_vals_raw
-                    ], dtype=np.float32)
-            else:
-                pae_col_mean = hf[complex_id]["pae_col_mean"][()]
-                pae_col_mean = pae_col_mean[valid_pair_mask]
+                    pae_col_mean = hf[complex_id]["pae_col_mean"][()]
+                    pae_col_mean = pae_col_mean[valid_pair_mask]
 
-                # pae_col_std = hf[complex_id]["pae_col_std"][()] # Not currently used for centering
-                interchain_pae_vals_centered = interchain_pae_vals_raw - pae_col_mean
-                # If interchain ca distances are available, add them to the features
-                if interchain_ca_distances_raw is not None:
-                    feats = np.array([
-                        interchain_indexes_i,
-                        interchain_indexes_j,
-                        pae_col_mean,
-                        interchain_pae_vals_centered,
-                        interchain_ca_distances_raw,
-                    ], dtype=np.float32)
-                else:
-                    feats = np.array([
-                        interchain_indexes_i,
-                        interchain_indexes_j,
-                        pae_col_mean,
-                        interchain_pae_vals_centered,
-                    ], dtype=np.float32)
+                    # pae_col_std = hf[complex_id]["pae_col_std"][()] # Not currently used for centering
+                    interchain_pae_vals_centered = interchain_pae_vals_raw - pae_col_mean
+                    # If interchain ca distances are available, add them to the features
+                    if interchain_ca_distances_raw is not None:
+                        feats = np.array([
+                            interchain_indexes_i,
+                            interchain_indexes_j,
+                            pae_col_mean,
+                            interchain_pae_vals_centered,
+                            interchain_ca_distances_raw,
+                        ], dtype=np.float32)
+                    else:
+                        feats = np.array([
+                            interchain_indexes_i,
+                            interchain_indexes_j,
+                            pae_col_mean,
+                            interchain_pae_vals_centered,
+                        ], dtype=np.float32)
+            else:
+                feats = np.array([
+                    interchain_indexes_i,
+                    interchain_indexes_j,
+                    interchain_ca_distances_raw,
+                ], dtype=np.float32)
             
         
         
@@ -482,19 +499,21 @@ class AntibodyAntigenPAEDataset(Dataset):
         if self.feature_transform:
             feats = self.feature_transform(feats)
         
+        # print(f"feats shape: {feats.shape}")
+
         # Transform label(s) using clipped logit - works element-wise if label is an array
         # print(f"label before: {label}")
         epsilon = 1e-6
         label = np.clip(label, epsilon, 1 - epsilon)
         label = np.log(label / (1 - label))
-        
 
         return {
             "features": torch.from_numpy(feats),            # [3..5, n]
             "label":    torch.tensor(label, dtype=torch.float32), # DockQ (logit transformed)
             "weight":   torch.tensor(row["weight"]),         # importance weight
             "length":   torch.tensor(len(feats[0])),         # length of the sample
-            "complex_id": complex_id
+            "complex_id": complex_id,
+            "ranking_score": torch.tensor(ranking_score)
         }
 
 
@@ -509,6 +528,7 @@ def get_eval_dataloader(manifest_csv: str,
                         feature_transform: bool = False,
                         feature_centering: bool = False,
                         use_interchain_ca_distances: bool = False,
+                        use_interchain_pae: bool = True,
                         seed: int = None,
                         distributed: bool = False,
                         world_size: int = 1,
@@ -519,9 +539,9 @@ def get_eval_dataloader(manifest_csv: str,
     """
     if feature_transform:
         print("Val dataloader: Using triangular positional encoding")
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering, use_interchain_ca_distances=use_interchain_ca_distances)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances)
     else:
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_ca_distances=use_interchain_ca_distances)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances)
     
     # Calculate local batch size for distributed training
     local_batch_size = calculate_local_batch_size(batch_size, world_size) if distributed else batch_size
@@ -576,6 +596,7 @@ def get_dataloader(manifest_csv: str,
                    feature_transform: bool = False,
                    feature_centering: bool = False,
                    use_interchain_ca_distances: bool = False,
+                   use_interchain_pae: bool = True,
                    seed: int = None,
                    distributed: bool = False,
                    world_size: int = 1,
@@ -594,9 +615,9 @@ def get_dataloader(manifest_csv: str,
     """
     if feature_transform:
         print("Train dataloader: Using triangular positional encoding")
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering, use_interchain_ca_distances=use_interchain_ca_distances)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances)
     else:
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_ca_distances=use_interchain_ca_distances)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances)
 
     # Calculate local batch size for distributed training
     local_batch_size = calculate_local_batch_size(batch_size, world_size) if distributed else batch_size

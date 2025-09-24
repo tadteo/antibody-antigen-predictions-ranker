@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 from scipy.stats import spearmanr
 from tqdm import tqdm
 from collections import defaultdict
+import random
 
 # Lightning Fabric for distributed training
 
@@ -36,17 +37,6 @@ from src.models.deep_set import DeepSet, init_weights
 torch.set_float32_matmul_precision("high")
 
 const_eps = 1e-6
-
-def _scatter_true_vs_preds(true, model, base=None, title="", xlab="True DockQ", ylab="Prediction"):
-    fig, ax = plt.subplots(figsize=(4, 4), dpi=120)
-    ax.scatter(true, model, s=12, alpha=0.8, label="model")
-    if base is not None:
-        ax.scatter(true, base, s=12, alpha=0.6, marker="x", label="baseline")
-    ax.plot([0, 1], [0, 1], "--", alpha=0.35)
-    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
-    ax.set_xlabel(xlab); ax.set_ylabel(ylab); ax.set_title(title)
-    if base is not None: ax.legend(frameon=False, fontsize=8)
-    return fig
 
 def calculate_soft_rho(pred_sig: np.ndarray, true_sig: np.ndarray, tau=0.1):
     """
@@ -72,7 +62,7 @@ def calculate_soft_rho(pred_sig: np.ndarray, true_sig: np.ndarray, tau=0.1):
     r_true = r_true - r_true.mean()
     denom = (np.sqrt((r_pred * r_pred).sum()) * np.sqrt((r_true * r_true).sum())) + const_eps
     if denom <= const_eps:
-        return 0.0
+        return 1.0 # decided that if all elements are the same, then the correlation is 1.0
     return float((r_pred * r_true).sum() / denom)
 
 def calculate_spearman(pred_sig: np.ndarray, true_sig: np.ndarray):
@@ -82,11 +72,25 @@ def calculate_spearman(pred_sig: np.ndarray, true_sig: np.ndarray):
     """
     ps = pred_sig
     ts = true_sig
+    
+    constant_prediction = np.max(ps)-np.min(ps) < 1e-2
+    constant_target = np.max(ts)-np.min(ts) < 1e-2
 
-    rho, _ = spearmanr(ps, ts)
-    if np.isnan(rho):
+    if constant_prediction and constant_target:
+        rho = 1.0
+        soft_rho = 1.0
+    elif constant_prediction and not constant_target:
         rho = 0.0
-    soft_rho = calculate_soft_rho(ps, ts)
+        soft_rho = 0.0
+    elif constant_target and not constant_prediction:
+        rho = 0.0
+        soft_rho = 0.0
+    else:
+   
+        rho, _ = spearmanr(ps, ts)
+        if np.isnan(rho):
+            rho = 1.0 # decided that if all elements are the same, then the correlation is 1.0
+        soft_rho = calculate_soft_rho(ps, ts)
 
     return (rho, soft_rho)
 
@@ -342,6 +346,8 @@ def main():
     feature_transform   = cfg.data.feature_transform
     feature_centering   = cfg.data.get('feature_centering', False)
     use_interchain_ca_distances = cfg.data.get('use_interchain_ca_distances', False)
+    use_interchain_pae = cfg.data.get('use_interchain_pae', True)
+    print(f"Use interchain PAE: {use_interchain_pae}")
 
     # adaptive weight: focus more on extreme targets (DockQ near 0 or 1)
     adaptive_weight = cfg.training.get('adaptive_weight', False)
@@ -353,6 +359,7 @@ def main():
         print(f"Feature transform: {feature_transform}")
         print(f"Feature centering: {feature_centering}")
         print(f"Use interchain Cα distances: {use_interchain_ca_distances}")
+        print(f"Use interchain PAE: {use_interchain_pae}")
 
     # 3) DataLoaders
     #    - train: with our chosen sampler
@@ -370,6 +377,7 @@ def main():
         feature_transform=feature_transform,
         feature_centering=feature_centering,
         use_interchain_ca_distances=use_interchain_ca_distances,
+        use_interchain_pae=use_interchain_pae,
         seed=seed,
         distributed=is_distributed,
         world_size=world_size,
@@ -385,6 +393,7 @@ def main():
         feature_transform=feature_transform,
         feature_centering=feature_centering,
         use_interchain_ca_distances=use_interchain_ca_distances,
+        use_interchain_pae=use_interchain_pae,
         seed=seed,
         distributed=is_distributed,
         world_size=world_size,
@@ -394,11 +403,11 @@ def main():
     # Model, device, optimizer
     # Adjust input_dim if we append interchain Cα distances as an extra feature
     input_dim_base   = int(cfg.model.input_dim)
-    input_dim        = input_dim_base + (1 if use_interchain_ca_distances else 0)
+    input_dim        = input_dim_base + (1 if use_interchain_ca_distances else 0) - (0 if use_interchain_pae else 2)
     phi_hidden_dims  = cfg.model.phi_hidden_dims
     rho_hidden_dims  = cfg.model.rho_hidden_dims
     aggregator       = cfg.model.aggregator
-
+    print(f"input_dim: {input_dim}")
     model = DeepSet(input_dim, phi_hidden_dims, rho_hidden_dims, aggregator=aggregator)
     model.apply(init_weights)
 
@@ -556,7 +565,7 @@ def main():
     #phi_hidden_dims and rho_hiddens_dims to string
     phi_hidden_dims_str = '_'.join(str(dim) for dim in phi_hidden_dims)
     rho_hidden_dims_str = '_'.join(str(dim) for dim in rho_hidden_dims)
-    name = f"DeepSet_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_weighted_loss_{weighted_loss}_aggregator_{aggregator}_lr_scheduler_{learning_rate_scheduler_str}"
+    name = f"DeepSet_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_no_ca_weighted_loss_{weighted_loss}_aggregator_{aggregator}_lr_scheduler_{learning_rate_scheduler_str}"
 
     # run_id = os.getenv("SLURM_JOB_ID", "local")
     # Initialize W&B run (only on rank 0)
@@ -631,7 +640,7 @@ def main():
     
     #Setup variables useful for logging
     #We define a step as a batch (a gradient step)
-    log_interval = len(train_loader)//4
+    log_interval = len(train_loader)//2
     log_interval_counter = 0
     running_loss = 0.0
     step = 0
@@ -800,8 +809,11 @@ def main():
                     # =============== TABLE 1: Per-complex prediction vs target ===============
                     per_complex_table = wandb.Table(columns=["step", "epoch", "complex_id", "image"])
                     
-                    # Create scatter plots for each complex
-                    for complex_id in cid:
+                    # Create scatter plots for 10 random complexes
+                    random_cids = random.sample(cid, 10)
+                    print(f"Random complexes: {random_cids}")
+                    
+                    for complex_id in random_cids:
                         if complex_id in per_complex_points:
                             complex_preds = np.array(per_complex_points[complex_id]['model'])
                             complex_targets = np.array(per_complex_points[complex_id]['true'])
