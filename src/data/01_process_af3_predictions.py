@@ -46,7 +46,9 @@ REQUIRED FILES:
    │   ├── 7b5g/
    │   │   ├── seed-1_sample-0/
    │   │   │   ├── model.cif
-   │   │   │   └── confidences.json
+   │   │   │   ├── summary_confidences.json
+   |   |   |   └── confidences.json
+   |   |   |   
    │   │   └── seed-1_sample-1/
    │   └── 7r0j/
    └── seed-2/
@@ -183,7 +185,7 @@ GRAPHICAL PIPELINE:
        │   ├── Extract PAE matrix
        │   ├── Extract token_chain_ids
        │   ├── Extract token_res_ids
-       │   └── Extract confidence scores (ptm, iptm, ranking_confidence)
+       │   └── Extract confidence scores (ptm, iptm, ranking_score)
        │
        ├── 🔗 Merge chains for DockQ computation
        │   ├── Merge antigen chains → "Ag"
@@ -214,7 +216,7 @@ GRAPHICAL PIPELINE:
 │   │   ├── AF3 Confidence Scores:
 │   │   │   ├── ptm                            ← Predicted TM score
 │   │   │   ├── iptm                           ← Interface predicted TM score
-│   │   │   └── ranking_confidence             ← AF3 ranking confidence
+│   │   │   └── ranking_score             ← AF3 ranking confidence
 │   │   │
 │   │   ├── TM Scores:
 │   │   │   ├── tm_normalized_reference        ← TM-score vs reference
@@ -260,7 +262,7 @@ DEPENDENCIES:
 - h5py: For H5 file creation
 - pandas: For metadata handling
 - numpy: For matrix operations
-- json: For confidences.json parsing
+- json: For confidences.json and summary_confidences.json parsing
 
 NOTES:
 - TM-score calculation requires proper implementation (e.g., TM-align)
@@ -281,7 +283,7 @@ import sys              # For system-specific parameters and functions
 import subprocess       # For running external commands
 import pandas as pd     # For data manipulation and CSV reading
 import glob             # For file pattern matching
-import json             # For parsing JSON files (confidences.json)
+import json             # For parsing JSON files (confidences.json and summary_confidences.json)
 import h5py             # For creating and writing H5 files
 import numpy as np      # For numerical operations and array handling
 import DockQ.DockQ      # For DockQ score computation
@@ -311,11 +313,11 @@ USALIGN_PATH = "/proj/berzelius-2021-29/users/x_matta/antibody-antigen-predictio
 # AF3 CONFIDENCE SCORE EXTRACTION
 # =============================================================================
 
-def extract_af3_scores(confidences_file):
+def extract_af3_scores(confidences_file, summary_confidences_file):
     """
-    Extract AlphaFold3 confidence scores from confidences.json file.
+    Extract AlphaFold3 confidence scores from summary_confidences.json file.
     
-    This function parses the confidences.json file that AlphaFold3 generates
+    This function parses the summary_confidences.json file that AlphaFold3 generates
     for each prediction. It extracts:
     - PAE (Predicted Aligned Error) matrix
     - Chain and residue identifiers
@@ -323,6 +325,7 @@ def extract_af3_scores(confidences_file):
     
     Args:
         confidences_file (str): Path to confidences.json file
+        summary_confidences_file (str): Path to summary_confidences.json file
     
     Returns:
         dict: Dictionary containing all extracted scores and matrices
@@ -331,7 +334,7 @@ def extract_af3_scores(confidences_file):
               - token_res_ids: Residue IDs
               - ptm: Predicted TM score
               - iptm: Interface predicted TM score
-              - ranking_confidence: AF3 ranking confidence
+              - ranking_score: AF3 ranking confidence
     """
     try:
         # Load JSON data from confidences file
@@ -343,28 +346,23 @@ def extract_af3_scores(confidences_file):
         token_chain_ids = np.array(data['token_chain_ids'])   # Chain IDs for each residue
         token_res_ids = np.array(data['token_res_ids'])       # Residue IDs
         
+        with open(summary_confidences_file, 'r') as f:
+            data_summary = json.load(f)
         # Extract confidence scores if available in the JSON
         # These might not always be present in confidences.json
-        ptm = data.get('ptm', np.nan)                    # Predicted TM score
-        iptm = data.get('iptm', np.nan)                  # Interface predicted TM score
-        ranking_confidence = data.get('ranking_confidence', np.nan)  # AF3 ranking confidence
+        ptm = data_summary.get('ptm', np.nan)                    # Predicted TM score
+        iptm = data_summary.get('iptm', np.nan)                  # Interface predicted TM score
+        ranking_score = data_summary.get('ranking_score', np.nan)  # AF3 ranking confidence
         
         # If confidence scores are not available, estimate them from PAE matrix
         if np.isnan(ptm):
-            # Estimate PTM from PAE matrix using a simplified approach
-            # PTM is inversely related to PAE - lower PAE = higher PTM
-            # Normalize to 0-1 range (30Å is roughly the maximum meaningful PAE)
-            avg_pae = np.mean(pae_matrix)
-            ptm = max(0, 1 - (avg_pae / 30.0))
+            raise ValueError(f"ptm is nan for {summary_confidences_file}")
         
         if np.isnan(iptm):
-            # Estimate iPTM from PTM
-            # iPTM is typically slightly lower than PTM as it focuses on interface regions
-            iptm = ptm * 0.95
+            raise ValueError(f"iptm is nan for {summary_confidences_file}")
         
-        if np.isnan(ranking_confidence):
-            # Use PTM as a proxy for ranking confidence
-            ranking_confidence = ptm
+        if np.isnan(ranking_score):
+            raise ValueError(f"ranking_score is nan for {summary_confidences_file}")
         
         return {
             'pae_matrix': pae_matrix,
@@ -372,11 +370,11 @@ def extract_af3_scores(confidences_file):
             'token_res_ids': token_res_ids,
             'ptm': ptm,
             'iptm': iptm,
-            'ranking_confidence': ranking_confidence
+            'ranking_score': ranking_score
         }
         
     except Exception as e:
-        logger.error(f"Error extracting AF3 scores from {confidences_file}: {e}")
+        logger.error(f"Error extracting AF3 scores from {summary_confidences_file}: {e}")
         return None
 
 # =============================================================================
@@ -470,7 +468,7 @@ def compute_tm_score(prediction_file, reference_file, chain_info):
 
 def find_confidences_file(prediction_folder):
     """
-    Find the confidences.json file in the prediction folder.
+    Find the confidences.json and summary_confidences.json file in the prediction folder.
     
     AlphaFold3 generates confidence files with various naming conventions.
     This function searches for the file using multiple possible names.
@@ -479,21 +477,15 @@ def find_confidences_file(prediction_folder):
         prediction_folder (str): Path to folder containing prediction files
     
     Returns:
-        str or None: Path to confidences.json file or None if not found
+        str or None: Path to confidences.json and summary_confidences.json files or None if not found
     """
     # Primary filename to look for
     confidences_file = os.path.join(prediction_folder, "confidences.json")
-    if os.path.exists(confidences_file):
-        return confidences_file
+    summary_confidences_file = os.path.join(prediction_folder, "summary_confidences.json")
+    if os.path.exists(confidences_file) and os.path.exists(summary_confidences_file):
+        return confidences_file, summary_confidences_file
     
-    # Alternative filenames that might be used
-    alt_names = ["confidence.json", "scores.json", "metrics.json", "full_confidences.json"]
-    for name in alt_names:
-        alt_file = os.path.join(prediction_folder, name)
-        if os.path.exists(alt_file):
-            return alt_file
-    
-    return None
+    return None, None
 
 
 
@@ -1038,7 +1030,7 @@ def compute_residue_distance_info(prediction_file: str,
         )
 
 def process_sample(h5_file, pdb_id, seed_name, sample_name, prediction_file, 
-                                        reference_file, chain_info, confidences_file):
+                                        reference_file, chain_info, confidences_file, summary_confidences_file):
     """
     Process a sample.
     
@@ -1051,7 +1043,7 @@ def process_sample(h5_file, pdb_id, seed_name, sample_name, prediction_file,
         reference_file (str): Path to reference structure file
         chain_info (dict): Dictionary with chain information
         confidences_file (str): Path to confidences.json file
-    
+        summary_confidences_file (str): Path to summary_confidences.json file
     Returns:
         bool: True if processing succeeded, False if failed
     """
@@ -1164,7 +1156,7 @@ def process_sample(h5_file, pdb_id, seed_name, sample_name, prediction_file,
         # 2. Extract AF3 confidence scores with error handling
         if confidences_file:
             try:
-                af3_scores = extract_af3_scores(confidences_file)
+                af3_scores = extract_af3_scores(confidences_file, summary_confidences_file)
                 if af3_scores:
                     # Save structural data (matrices)
                     logger.debug(f"Saving pae_matrix for {sample_group_name}")
@@ -1175,12 +1167,12 @@ def process_sample(h5_file, pdb_id, seed_name, sample_name, prediction_file,
                     sample_group.create_dataset('token_chain_ids', data=token_chain_ids_str, dtype=h5py.string_dtype(encoding='utf-8'))
                     logger.debug(f"Saving token_res_ids for {sample_group_name}")
                     sample_group.create_dataset('token_res_ids', data=af3_scores['token_res_ids'], dtype='int32')
-                    
+                      
                     logger.debug(f"Saving ptm for {sample_group_name}")
                     # Save confidence scores
                     sample_group.create_dataset('ptm', data=af3_scores['ptm'])
                     sample_group.create_dataset('iptm', data=af3_scores['iptm'])
-                    sample_group.create_dataset('ranking_confidence', data=af3_scores['ranking_confidence'])
+                    sample_group.create_dataset('ranking_score', data=af3_scores['ranking_score'])
                     
                     # Process inter-chain interactions
                     inter_idx = []
@@ -1712,8 +1704,9 @@ def process_complex(pdb_id, output_folder, metadata_df, af3_folder, reference_fo
                 
                 # Find confidences file for this sample
                 prediction_folder = os.path.dirname(prediction_file)
-                confidences_file = find_confidences_file(prediction_folder)
+                confidences_file, summary_confidences_file = find_confidences_file(prediction_folder)
                 sample_log['confidences_file'] = confidences_file
+                sample_log['summary_confidences_file'] = summary_confidences_file
                 
                 if not confidences_file:
                     warning_msg = f"No confidences file found for {sample_name}"
@@ -1723,7 +1716,7 @@ def process_complex(pdb_id, output_folder, metadata_df, af3_folder, reference_fo
                 # Process the sample and save to H5
                 try:
                     success = process_sample(h5_file, pdb_id, seed_name, sample_name, 
-                                                    prediction_file, reference_file, chain_info, confidences_file)
+                                                    prediction_file, reference_file, chain_info, confidences_file, summary_confidences_file)
                     
                     sample_log['processing_end'] = datetime.now().isoformat()
                     

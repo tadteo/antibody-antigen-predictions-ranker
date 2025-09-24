@@ -53,7 +53,7 @@ def build_manifest(h5_dir, val_frac, test_frac, seed, out_csv, weight_strategy):
                     dockq = float(hf[f"{complex_id}/{sample}/abag_dockq"][()])
                     ptm = float(hf[f"{complex_id}/{sample}/ptm"][()])
                     iptm = float(hf[f"{complex_id}/{sample}/iptm"][()])
-                    ranking_confidence = float(hf[f"{complex_id}/{sample}/ranking_confidence"][()])
+                    ranking_score = float(hf[f"{complex_id}/{sample}/ranking_score"][()])
                     tm_normalized = float(hf[f"{complex_id}/{sample}/tm_normalized_reference"][()])
                     
                     # Skip if DockQ is NaN
@@ -69,7 +69,7 @@ def build_manifest(h5_dir, val_frac, test_frac, seed, out_csv, weight_strategy):
                             'label': dockq,
                             'ptm': ptm,
                             'iptm': iptm,
-                            'ranking_confidence': ranking_confidence,
+                            'ranking_score': ranking_score,
                             'tm_normalized': tm_normalized,
                             'weight': None,
                             'split': None
@@ -276,7 +276,7 @@ def parse_args():
                    help='Fraction for test split')
     p.add_argument('--seed', type=int, default=42,
                    help='Random seed for reproducibility')
-    p.add_argument('--out_csv', default='data/manifest_new_with_distance_filtered_pae_centered.csv',
+    p.add_argument('--out_csv', default='data/manifest_new_with_filtered_test.csv',
                    help='Output path for manifest CSV')
     p.add_argument('--weight_strategy', choices=['bucket','uniform','density','density_with_clipping'], default='density_with_clipping',
                    help='Strategy for sample weights: bucket or uniform')

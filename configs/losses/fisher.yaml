@@ -1,0 +1,10 @@
+training:
+  spearman_tau: 0.05
+  ranking_loss_start_epoch: 1
+  lambda_start: 1.0
+  lambda_min: 0.2
+  lambda_max: 10.0
+  lambda_update_every: 8             # update λ every M steps (reduces jitter)
+  lambda_eta: 0.25          # gentle multiplicative update (0.1–0.3 good)
+  lambda_ema_alpha: 0.97          # EMA on the ratio (0.95–0.99 smooth)
+  

@@ -70,8 +70,12 @@ def pad_collate_fn(batch, batch_size, samples_per_complex):
     # print(f"complex_ids shape: {complex_ids.shape}")
 
     # Check that all complex_ids in the last dimension are the same
-    if not np.all(complex_ids[:, 0] == complex_ids[:, 1]):
-        raise ValueError("All complex_ids in the last dimension must be the same")
+    # if not np.all(complex_ids[:, 0] == complex_ids[:, 1]):
+    #     raise ValueError("All complex_ids in the last dimension must be the same")
+    # Ensure all K decoys per B row belong to the same complex
+    rows_equal = np.all([len(set(row)) == 1 for row in complex_ids.tolist()])
+    if not rows_equal:
+        raise ValueError("All decoys in a row must share the same complex_id")
 
     return {
       "features": padded,        # [B, K, N, F]
@@ -309,6 +313,50 @@ class WeightedComplexSampler(Sampler):
         return math.ceil(total_samples / self.batch_size)
 
 
+class PerComplexSequentialSampler(torch.utils.data.Sampler):
+    """
+    Deterministic, no-shuffle sampler for evaluation.
+    Yields flat lists of indices of length B*K (B complexes × K decoys),
+    in manifest order. Drops the remainder if the last chunk/batch is shorter than B.
+    """
+    def __init__(self, dataset, batch_size: int, samples_per_complex: int):
+        self.df = dataset.df                      # already split='val'
+        self.batch_size = batch_size              # B
+        self.K = samples_per_complex              # K
+
+        # Complexes in manifest order (no shuffle)
+        from collections import OrderedDict
+        self.by_cid = OrderedDict(
+            (cid, g.index.to_list())
+            for cid, g in self.df.groupby("complex_id", sort=False)
+        )
+
+        # Build per-complex chunks of exactly K indices (drop the remainder)
+        self.chunks = []
+        for _, rows in self.by_cid.items():
+            rows = list(rows)
+             # only keep full K-sized windows; drop the remainder
+            full = (len(rows) // self.K) * self.K
+            for i in range(0, full, self.K):
+                chunk = rows[i:i+self.K]
+                self.chunks.append(chunk)
+
+        # Batch chunks deterministically into size B; drop if last batch is smaller than B
+        self.batches = []
+        for i in range(0, len(self.chunks), self.batch_size):
+            batch_chunks = self.chunks[i:i+self.batch_size]
+            flat = [idx for ch in batch_chunks for idx in ch]
+            self.batches.append(flat)
+
+    def __iter__(self):
+        for flat in self.batches:
+            yield flat
+
+    def __len__(self):
+        return len(self.batches)
+
+
+
 # ==============================================================================
 #  Dataset: load features on‐the‐fly from your H5 files
 # ==============================================================================
@@ -479,15 +527,22 @@ def get_eval_dataloader(manifest_csv: str,
     local_batch_size = calculate_local_batch_size(batch_size, world_size) if distributed else batch_size
     collate = create_distributed_collate_fn(local_batch_size, samples_per_complex)
 
-    base_sampler = WeightedComplexSampler(
-            dataset,
-            samples_per_complex=samples_per_complex,
-            batch_size=batch_size,
-            weighted=False,
-            replacement=True,
-            seed=seed
-        )
-    
+    # base_sampler = WeightedComplexSampler(
+    #         dataset,
+    #         samples_per_complex=samples_per_complex,
+    #         batch_size=batch_size,
+    #         weighted=False,
+    #         replacement=True,
+    #         seed=seed
+    #     )
+
+    # --- Deterministic, sequential sampler for validation ---
+    base_sampler = PerComplexSequentialSampler(
+        dataset,
+        batch_size=batch_size,
+        samples_per_complex=samples_per_complex
+    )
+        
     # Wrap with distributed sampler if needed (validation typically doesn't drop_last)
     if distributed:
         sampler = DistributedBatchSampler(

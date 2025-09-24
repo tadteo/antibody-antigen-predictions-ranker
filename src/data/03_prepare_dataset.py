@@ -42,6 +42,7 @@ def process_h5_file(input_path, output_path):
                 in_complex_group = in_hf[complex_id]
                 out_complex_group = out_hf.create_group(complex_id)
                 pae_list = []  # Store PAE values from all samples for this complex
+                ca_distances_list = []  # Store CA distances values from all samples for this complex
                 sample_names = list(in_complex_group.keys())
                 
                 # Process each prediction sample for the current complex

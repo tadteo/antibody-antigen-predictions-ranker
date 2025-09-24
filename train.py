@@ -18,6 +18,10 @@ import time
 import numpy as np
 from datetime import datetime
 from omegaconf import OmegaConf
+import matplotlib.pyplot as plt
+from scipy.stats import spearmanr
+from tqdm import tqdm
+from collections import defaultdict
 
 # Lightning Fabric for distributed training
 
@@ -31,6 +35,62 @@ from src.models.deep_set import DeepSet, init_weights
 
 torch.set_float32_matmul_precision("high")
 
+const_eps = 1e-6
+
+def _scatter_true_vs_preds(true, model, base=None, title="", xlab="True DockQ", ylab="Prediction"):
+    fig, ax = plt.subplots(figsize=(4, 4), dpi=120)
+    ax.scatter(true, model, s=12, alpha=0.8, label="model")
+    if base is not None:
+        ax.scatter(true, base, s=12, alpha=0.6, marker="x", label="baseline")
+    ax.plot([0, 1], [0, 1], "--", alpha=0.35)
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    ax.set_xlabel(xlab); ax.set_ylabel(ylab); ax.set_title(title)
+    if base is not None: ax.legend(frameon=False, fontsize=8)
+    return fig
+
+def calculate_soft_rho(pred_sig: np.ndarray, true_sig: np.ndarray, tau=0.1):
+    """
+    pred_sig, true_sig: [K] in [0,1]
+    Returns: soft Spearman rho
+    """
+
+    K = len(pred_sig)
+    # --- soft rank helper (inline to keep everything in this function) ---
+    # rank_i ≈ 1 + sum_{j≠i} sigmoid((s_i - s_j)/tau)
+    # Since sigmoid(0)=0.5, we can do: 1 + (sum_j sigmoid(...) - 0.5)
+    def _soft_rank(scores: np.ndarray, tau: float) -> np.ndarray:
+        s = scores.reshape(-1, 1)                  # [K,1]
+        D = s - s.T                                # [K,K]
+        P = 1.0 / (1.0 + np.exp(-D / tau))         # [K,K]
+        return 1.0 + (P.sum(axis=1) - 0.5)         # [K]
+
+    r_pred = _soft_rank(pred_sig, tau)             # [K]
+    r_true = _soft_rank(true_sig, tau)             # [K]
+
+    # Safe Pearson correlation between rank vectors
+    r_pred = r_pred - r_pred.mean()
+    r_true = r_true - r_true.mean()
+    denom = (np.sqrt((r_pred * r_pred).sum()) * np.sqrt((r_true * r_true).sum())) + const_eps
+    if denom <= const_eps:
+        return 0.0
+    return float((r_pred * r_true).sum() / denom)
+
+def calculate_spearman(pred_sig: np.ndarray, true_sig: np.ndarray):
+    """
+    pred_sig, true_sig: [K] in [0,1]
+    Returns: [K] tensor of true Spearman rho and soft Spearman rho
+    """
+    ps = pred_sig
+    ts = true_sig
+
+    rho, _ = spearmanr(ps, ts)
+    if np.isnan(rho):
+        rho = 0.0
+    soft_rho = calculate_soft_rho(ps, ts)
+
+    return (rho, soft_rho)
+
+ 
 def pairwise_soft_rank(scores, tau=0.1):
     """
     scores : Tensor [..., K]
@@ -45,13 +105,13 @@ def pairwise_soft_rank(scores, tau=0.1):
     soft_rank = 1 + P.sum(dim=-1) - torch.diagonal(P, dim1=-2, dim2=-1)
     return soft_rank
 
-def fisher_spearman_soft_loss(pred, target, tau=0.2):
+def soft_spearman_loss(pred, target, loss_type='one_minus_rho', tau=0.2):
     """
     pred, target : shape [B, K] in DockQ (0–1) space
     returns scalar 1 - ρ loss per complex [B]
     Assumes K >= 2, which is handled by the caller.
     
-    It calculates the spearman soft loss and after it applies a Fisher transform (atanh) 
+    It calculates the spearman soft loss and after it applies a Fisher transform (atanh) or a simple one_minus_rho 
     to the loss to make it in the same order of magnitude thatn the s1smoothloss on the regression loss.
     
     """
@@ -74,12 +134,18 @@ def fisher_spearman_soft_loss(pred, target, tau=0.2):
         return torch.zeros(pred.size(0), device=pred.device, dtype=pred.dtype)
 
     rho_soft = 1 - 6 * mse / denominator # per complex [B]
-
-    #apply fisher transform
     rho_soft = torch.clamp(rho_soft, min=-1.0 + 1e-6, max=1.0 - 1e-6)
-    atanh_rho_soft = torch.atanh(rho_soft)
 
-    return -atanh_rho_soft # per complex [B], to be minimized (hence -athan of rho)
+    if loss_type == 'fisher':
+        atanh_rho_soft = torch.atanh(rho_soft)
+        #softplus of -atanh to keep it bounded to 0 to infinity
+        loss = torch.softplus(-atanh_rho_soft) # per complex [B], to be minimized (hence -atanh of rho) range plus minus infinity, minus infinity is best correlation
+    elif loss_type == 'one_minus_rho':
+        loss = 1.0 - rho_soft #per complex [B], to be minimized (hence 1 - rho) range 0 to 2, 0 is best correlation
+    else:
+        raise ValueError(f"Invalid loss type: {loss_type}")
+
+    return loss
 
 def main():
     # 1) Setup argument parsing
@@ -101,6 +167,10 @@ def main():
     parser.add_argument(
         '--precision', type=str, default="32",
         help='Training precision (32, 16-mixed, bf16-mixed)'
+    )
+    parser.add_argument(
+        '--config_overrides', type=str, nargs='*', default=[],
+        help='Paths to YAML files merged over the base config (e.g., configs/schedulers/onecycle.yaml)'
     )
     
     # Parse known arguments (config path, output_dir, resume)
@@ -149,6 +219,57 @@ def main():
     OmegaConf.register_new_resolver("add", lambda x, y: x + y)
     cfg = OmegaConf.load(args.config)
 
+    # Merge optional override YAMLs (later files win on conflicts)
+    if getattr(args, 'config_overrides', None):
+        override_confs = [OmegaConf.load(p) for p in args.config_overrides]
+        cfg = OmegaConf.merge(cfg, *override_confs)
+
+    # Auto-merge scheduler subconfiguration based on lr_scheduler_type
+    try:
+        sched_type = cfg.training.get('lr_scheduler_type', 'ReduceLROnPlateau')
+        explicit_sched_path = cfg.training.get('scheduler_config_path', None)
+        sched_filename_map = {
+            'OneCycleLR': 'onecycle.yaml',
+            'ReduceLROnPlateau': 'plateau.yaml',
+            'WarmupHoldLinear': 'warmup_hold_linear.yaml',
+        }
+        scheduler_cfg_path = None
+        if explicit_sched_path is not None:
+            scheduler_cfg_path = explicit_sched_path
+        else:
+            base_dir = os.path.dirname(os.path.abspath(args.config))
+            fname = sched_filename_map.get(sched_type)
+            if fname is not None:
+                scheduler_cfg_path = os.path.join(base_dir, 'schedulers', fname)
+        if scheduler_cfg_path is not None and os.path.exists(scheduler_cfg_path):
+            cfg = OmegaConf.merge(cfg, OmegaConf.load(scheduler_cfg_path))
+    except Exception as _:
+        raise ValueError(f"Invalid scheduler type: {sched_type}")
+
+    # Auto-merge loss subconfiguration based on ranking_loss_type
+    add_ranking_loss = cfg.training.get('add_ranking_loss', False)
+    
+    if add_ranking_loss:
+        try:
+            ranking_loss_type = cfg.training.get('ranking_loss_type', 'one_minus_rho')  # 'fisher' or 'one_minus_rho'
+            explicit_loss_path = cfg.training.get('loss_config_path', None)
+            loss_filename_map = {
+                'fisher': 'fisher.yaml',
+                'one_minus_rho': 'one_minus_rho.yaml',
+            }
+            loss_cfg_path = None
+            if explicit_loss_path is not None:
+                loss_cfg_path = explicit_loss_path
+            else:
+                base_dir = os.path.dirname(os.path.abspath(args.config))
+                lname = loss_filename_map.get(ranking_loss_type)
+                if lname is not None:
+                    loss_cfg_path = os.path.join(base_dir, 'losses', lname)
+            if loss_cfg_path is not None and os.path.exists(loss_cfg_path):
+                cfg = OmegaConf.merge(cfg, OmegaConf.load(loss_cfg_path))
+        except Exception:
+            raise ValueError(f"Invalid ranking loss type: {ranking_loss_type}")
+
     # Merge CLI-provided output_dir and resume into the config.
     # These take precedence over values in the YAML file.
     cli_provided_params = {}
@@ -170,7 +291,7 @@ def main():
             print(f"Warning: Could not parse all CLI overrides with OmegaConf: {e}")
             print(f"Ensure overrides are in 'key=value' format (e.g., training.lr=0.01). Unknown args received: {unknown_cli_args}")
 
-    # 1.a) Initialize W&B run (only on rank 0)
+    # 1.a) Initialize W&B login (only on rank 0) if enabled
     if fabric.global_rank == 0:
         load_dotenv()  # will read .env in cwd
         wandb.login(key=os.getenv("WANDB_API_KEY"), relogin=True)
@@ -207,11 +328,17 @@ def main():
     weighted_loss       = cfg.training.get('weighted_loss', False)
     # Ranking loss parameters
     add_ranking_loss    = cfg.training.get('add_ranking_loss', False)
-    ranking_loss_weight = cfg.training.get('ranking_loss_weight', 10)
     ranking_loss_start_epoch = cfg.training.get('ranking_loss_start_epoch', 1)
     spearman_tau        = cfg.training.get('spearman_tau', 0.02)
-    lambda_ema_alpha    = cfg.training.get('lambda_ema_alpha', 0.9) # For dynamic lambda smoothing
-
+    ranking_loss_type   = cfg.training.get('ranking_loss_type', 'one_minus_rho')  # 'fisher' or 'one_minus_rho'
+    # Ranking loss parameters
+    lambda_start        = cfg.training.get('lambda_start', 1.0)
+    lambda_min          = cfg.training.get('lambda_min', 0.2)
+    lambda_max          = cfg.training.get('lambda_max', 10.0)
+    lambda_update_every = cfg.training.get('lambda_update_every', 8)
+    lambda_eta          = cfg.training.get('lambda_eta', 0.25)
+    lambda_ema_alpha    = cfg.training.get('lambda_ema_alpha', 0.97)
+    
     feature_transform   = cfg.data.feature_transform
     feature_centering   = cfg.data.get('feature_centering', False)
     use_interchain_ca_distances = cfg.data.get('use_interchain_ca_distances', False)
@@ -370,6 +497,49 @@ def main():
         learning_rate_scheduler_str = (
             f"OneCycleLR_maxlr_{max_lr}_epochs_{epochs}_steps_per_epoch_{steps_per_epoch}"
         )
+    elif scheduler_type == "WarmupHoldLinear":
+        # --- % schedule settings ---
+        warmup_pct = float(cfg.training.get('warmup_pct', 0.10))  # 10% warmup
+        hold_pct   = float(cfg.training.get('hold_pct',   0.40))  # 40% hold
+        # decay_pct = 1 - warmup_pct - hold_pct
+
+        # absolute min lr (clearer than only factor); fallback to factor if not provided
+        base_lr     = lr  # your optimizer plateau (max) LR
+        min_lr_cfg  = cfg.training.get('min_lr', None)
+        min_factor  = float(cfg.training.get('min_lr_factor', 1e-2))
+        min_lr      = float(min_lr_cfg) if min_lr_cfg is not None else base_lr * min_factor
+
+        steps_per_epoch    = len(train_loader)
+        total_optim_steps  = int(np.ceil(epochs * steps_per_epoch))
+
+        warmup_steps = int(round(warmup_pct * total_optim_steps))
+        hold_steps   = int(round(hold_pct   * total_optim_steps))
+        decay_steps  = max(1, total_optim_steps - warmup_steps - hold_steps)
+
+        # factors relative to the optimizer's base lr
+        peak_fac = 1.0                      # plateau is optimizer lr
+        min_fac  = float(min_lr / base_lr)  # final factor
+
+        # optional: start warmup above 0 to avoid Adam "cold start"
+        start_factor = float(cfg.training.get('warmup_start_factor', 0.0))  # e.g., 0.1
+
+        def _whl_lambda(step):
+            # step is the optimizer step index (0, 1, 2, ...)
+            if step < warmup_steps:
+                t = step / max(1, warmup_steps)
+                return start_factor + (peak_fac - start_factor) * t
+            elif step < warmup_steps + hold_steps:
+                return peak_fac
+            else:
+                s = step - warmup_steps - hold_steps
+                x = min(1.0, s / max(1, decay_steps))       # 0 -> 1 over decay
+                # linear from peak_fac down to min_fac
+                return min_fac + (peak_fac - min_fac) * (1.0 - x)
+
+        learning_rate_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _whl_lambda)
+        learning_rate_scheduler_str = (
+            f"WarmupHoldLinear_w{warmup_steps}_h{hold_steps}_d{decay_steps}_minf{min_factor}"
+        )
     else:
         learning_rate_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
@@ -464,8 +634,7 @@ def main():
     log_interval = len(train_loader)//4
     log_interval_counter = 0
     running_loss = 0.0
-    running_grad_norm = 0.0
-    num_batches = 0
+    step = 0
     last_log_time = time.time()
     running_avg_dockq = 0.0
     running_ranking_loss = 0.0 # For accumulating base ranking loss values
@@ -474,9 +643,9 @@ def main():
     running_grad_norm_rank = 0.0 # For accumulating ||grad(L_rank)||
     
     # Initialize dynamic lambda for ranking loss
-    dynamic_ranking_lambda = ranking_loss_weight # Starts with the config value
+    dynamic_ranking_lambda = lambda_start # Starts with the config value
 
-    for epoch in range(start_epoch, epochs + 1):
+    for epoch in tqdm(range(start_epoch, epochs + 1), desc="Epochs", disable=fabric.global_rank != 0):
         model.train()
         epoch_start = time.time()
         
@@ -493,22 +662,27 @@ def main():
         add_rank_this_epoch = add_ranking_loss and (epoch >= ranking_loss_start_epoch)
 
         for batch in train_loader:
-
+            step += 1
             combined_loss_val, current_batch_size, avg_dockq, \
             current_regression_loss, current_base_ranking_loss_val, \
             current_grad_norm_reg, current_grad_norm_rank, \
             updated_dynamic_lambda = train_step(
                 model, batch, optimizer, base_criterion, device, 
+                step,
                 weighted_loss, adaptive_weight,
-                add_rank_this_epoch, spearman_tau, 
+                add_rank_this_epoch, spearman_tau, ranking_loss_type,
                 current_ranking_lambda=dynamic_ranking_lambda, # Pass current lambda
-                lambda_ema_alpha=lambda_ema_alpha,
-                fabric=fabric  # Pass fabric for autocast and backward
+                fabric=fabric,  # Pass fabric for autocast and backward
+                lambda_min=lambda_min,
+                lambda_max=lambda_max,
+                lambda_update_every=lambda_update_every,
+                lambda_eta=lambda_eta,
+                lambda_ema_alpha=lambda_ema_alpha
             )
             dynamic_ranking_lambda = updated_dynamic_lambda # Update lambda for next step
 
-            # Update learning rate
-            if scheduler_type == "OneCycleLR":
+            # Update learning rate per step for schedulers that are step-wise
+            if scheduler_type in ("OneCycleLR", "WarmupHoldLinear"):
                 learning_rate_scheduler.step()
             
             running_loss += combined_loss_val # This is now the combined loss
@@ -550,7 +724,7 @@ def main():
                     # Ratio of regression loss to base ranking loss (values, not grads)
                     log_dict["train/reg_vs_rank_loss_ratio"] = avg_regression_loss_interval / (avg_base_ranking_loss_interval + 1e-8) 
                 
-                # Only log on rank 0
+                # Only log on rank 0 if enabled
                 if fabric.global_rank == 0:
                     wandb.log(log_dict, step=log_interval_counter)
 
@@ -574,39 +748,156 @@ def main():
                         model, val_loader, base_criterion, device, weighted_loss,
                         add_ranking_loss=add_rank_this_epoch, 
                         spearman_tau=spearman_tau,
-                        current_ranking_lambda=dynamic_ranking_lambda
+                        current_ranking_lambda=dynamic_ranking_lambda,
+                        ranking_loss_type=ranking_loss_type,
+                        lambda_min=lambda_min,
+                        lambda_max=lambda_max,
+                        lambda_update_every=lambda_update_every,
+                        lambda_eta=lambda_eta,
+                        lambda_ema_alpha=lambda_ema_alpha
                     )
 
-                    val_loss_scalar = float(val_results['loss'])
+                    # ----  NaN check (tensors, numpy arrays, numpy scalars, floats) ----
+                    def _has_nan(x):
+                        import numpy as _np
+                        import torch as _torch
+                        if isinstance(x, _torch.Tensor):
+                            return _torch.isnan(x).any().item()
+                        if isinstance(x, (np.ndarray, np.generic)):
+                            return _np.isnan(x).any()
+                        if isinstance(x, float):
+                            return np.isnan(x)
+                        return False
 
-                    val_preds = val_results['preds'] 
-                    val_labels = val_results['labels']
+                    for key, val in val_results.items():
+                        if _has_nan(val):
+                            print(f"{key}: contains NaN")
+                            exit()
+
+                    val_loss_scalar = float(val_results['loss'])
+                    pcp = val_results['per_complex_points']
+                    val_preds  = np.concatenate([pcp[c]['model'] for c in pcp.keys()])
+                    val_labels = np.concatenate([pcp[c]['true']  for c in pcp.keys()])
 
                     # Check the difference between the predicted and true labels
                     errors = val_preds - val_labels
                     abs_errors = np.abs(errors)
 
                     abs_err_mean_scalar = float(abs_errors.mean())
-                    # Enhanced validation logging to W&B (only on rank 0)
+
+                    # Extract complex IDs and per-complex metrics from the returned data
+                    per_complex_points = val_results['per_complex_points']
+                    cid = list(per_complex_points.keys())
+                    
+                    rho_m = val_results['rho_true_per_complex']  # true rho for model predictions
+                    delta = val_results['delta_true_rho_per_complex']  # delta true rho per complex
+                    
+                    # Calculate baseline true rho by subtracting delta from model rho
+                    rho_b = rho_m - delta
+
+                    n = min(len(cid), len(rho_m), len(rho_b), len(delta))
+                    
+                    # =============== TABLE 1: Per-complex prediction vs target ===============
+                    per_complex_table = wandb.Table(columns=["step", "epoch", "complex_id", "image"])
+                    
+                    # Create scatter plots for each complex
+                    for complex_id in cid:
+                        if complex_id in per_complex_points:
+                            complex_preds = np.array(per_complex_points[complex_id]['model'])
+                            complex_targets = np.array(per_complex_points[complex_id]['true'])
+                            
+                            if len(complex_preds) > 0 and len(complex_targets) > 0:
+                                # Create scatter plot for this complex
+                                fig, ax = plt.subplots(figsize=(8, 6))
+                                ax.scatter(complex_targets, complex_preds, alpha=0.6)
+                                ax.plot([0, 1], [0, 1], 'r--', alpha=0.8)  # diagonal line
+                                ax.set_xlabel('True DockQ')
+                                ax.set_ylabel('Predicted DockQ')
+                                ax.set_title(f'Complex {complex_id}: Prediction vs Target (Epoch {epoch})')
+                                ax.grid(True, alpha=0.3)
+                                
+                                # Add single row to table for this complex
+                                per_complex_table.add_data(
+                                    log_interval_counter, epoch, str(complex_id), wandb.Image(fig)
+                                )
+                                plt.close(fig)
+                    
+                    # =============== TABLE 2: All complexes combined ===============
+                    all_complexes_table = wandb.Table(columns=["step", "epoch", "image"])
+                    
+                    # Create combined scatter plot
+                    if len(val_preds) > 0 and len(val_labels) > 0:
+                        fig, ax = plt.subplots(figsize=(10, 8))
+                        ax.scatter(val_labels, val_preds, alpha=0.6)
+                        ax.plot([0, 1], [0, 1], 'r--', alpha=0.8)  # diagonal line
+                        ax.set_xlabel('True DockQ')
+                        ax.set_ylabel('Predicted DockQ')
+                        ax.set_title(f'All Complexes: Prediction vs Target (Epoch {epoch})')
+                        ax.grid(True, alpha=0.3)
+                        
+                        all_complexes_table.add_data(log_interval_counter, epoch, wandb.Image(fig))
+                        plt.close(fig)
+                    
+                    # =============== TABLE 3: Delta rho vs baseline rho ===============
+                    delta_rho_table = wandb.Table(columns=["step", "epoch", "image"])
+                    
+                    # Create delta rho scatter plot for all complexes
+                    if len(rho_b) > 0 and len(delta) > 0:
+                        fig, ax = plt.subplots(figsize=(8, 6))
+                        
+                        valid_data = []
+                        for i in range(n):
+                            r_b = float(rho_b[i])
+                            d = float(delta[i])
+                            if np.isfinite(r_b) and np.isfinite(d):
+                                valid_data.append((r_b, d))
+                                ax.scatter(r_b, d, alpha=0.6, label=str(cid[i]) if len(cid) <= 10 else None)
+                        
+                        if valid_data:
+                            ax.axhline(y=0, color='r', linestyle='--', alpha=0.8)  # zero line
+                            ax.set_xlabel('Baseline True Rho')
+                            ax.set_ylabel('Delta Rho (Model - Baseline)')
+                            ax.set_title(f'Delta Rho vs Baseline Rho (Epoch {epoch})')
+                            ax.grid(True, alpha=0.3)
+                            if len(cid) <= 10:  # Only show legend if not too many complexes
+                                ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+                            
+                            delta_rho_table.add_data(log_interval_counter, epoch, wandb.Image(fig))
+                        
+                        plt.close(fig)
+
                     val_log_dict = {
-                        "val/loss": val_results['loss'],  # Combined loss
+                        # Core losses
+                        "val/loss": val_results['loss'],                     # Combined loss (scalar)
                         "val/regression_loss": val_results['regression_loss'],
+                        "val/ranking_loss": val_results['ranking_loss'],
                         "val/avg_dockq": val_results['avg_dockq'],
-                        "val/abs_error": abs_errors,
-                        
-                        # Distribution metrics:
+
+                        # Histograms (media)
+                        "val/soft_rho_histogram_per_complex": wandb.Histogram(val_results['rho_soft_per_complex'], num_bins=50),
+                        "val/true_rho_histogram_per_complex": wandb.Histogram(val_results['rho_true_per_complex'], num_bins=50),
+                        "val/baseline_rho_soft_histogram_per_complex": wandb.Histogram(val_results['rho_baseline_per_complex'], num_bins=50),
+                        "val/delta_soft_rho_histogram_per_complex": wandb.Histogram(val_results['delta_soft_rho_per_complex'], num_bins=50),
+                        "val/delta_true_rho_histogram_per_complex": wandb.Histogram(val_results['delta_true_rho_per_complex'], num_bins=50),
                         "val/abs_error_histogram": wandb.Histogram(abs_errors, num_bins=512),
+
+                        # Scalar summaries (no lists)
+                        "val/soft_rho_mean": val_results['soft_rho_mean'],
+                        "val/true_rho_mean": val_results['true_rho_mean'],
+                        "val/baseline_rho_soft_mean": val_results['baseline_rho_mean'],
+                        "val/delta_soft_rho_mean": val_results['delta_soft_rho_mean'],
+                        "val/delta_true_rho_mean": val_results['delta_true_rho_mean'],
                         "val/abs_error_mean": abs_err_mean_scalar,
-                        
-                        # Quantiles:
-                        "val/abs_error_q10": np.percentile(abs_errors, 10),
-                        "val/abs_error_q25": np.percentile(abs_errors, 25),
-                        "val/abs_error_q50": np.percentile(abs_errors, 50),
-                        "val/abs_error_q75": np.percentile(abs_errors, 75),
-                        "val/abs_error_q90": np.percentile(abs_errors, 90),
-                        "val/abs_error_max": abs_errors.max(),
-                        
+                        "val/abs_error_q25": float(np.percentile(abs_errors, 25)),
+                        "val/abs_error_q50": float(np.percentile(abs_errors, 50)),
+                        "val/abs_error_q75": float(np.percentile(abs_errors, 75)),
+                        "val/abs_error_max":  float(abs_errors.max()),
                         "val/epoch": epoch,
+                        
+                        # New validation tables
+                        "val/per_complex_pred_vs_target": per_complex_table,
+                        "val/all_complexes_pred_vs_target": all_complexes_table,
+                        "val/delta_rho_vs_baseline": delta_rho_table,
                     }
                     
                     # Add ranking loss metrics if enabled
@@ -615,7 +906,8 @@ def main():
                         val_log_dict["val/reg_vs_rank_loss_ratio"] = val_results['regression_loss'] / (val_results['ranking_loss'] + 1e-8)
                         val_log_dict["val/dynamic_ranking_lambda"] = dynamic_ranking_lambda
                     
-                    wandb.log(val_log_dict, step=log_interval_counter)
+                        if fabric.global_rank == 0:
+                            wandb.log(val_log_dict, step=log_interval_counter)
 
                 # broadcast scalar val_loss to every rank (sum of {x,0,0,...} -> x on all)
                 val_loss_t = torch.tensor(val_loss_scalar, device=fabric.device, dtype=torch.float32)
@@ -628,7 +920,7 @@ def main():
                 
                 # Only print on rank 0
                 if fabric.global_rank == 0:
-                    print(f"Epoch {epoch}/{epochs} step {log_interval_counter%len(train_loader)}/{len(train_loader)} — Train loss: {avg_loss:.8f}")
+                    print(f"Epoch {epoch}/{epochs} step {log_interval_counter%len(train_loader)}/{len(train_loader)} — Train loss: {avg_loss:.8f} --> regression loss: {avg_regression_loss_interval:.8f} --> ranking loss: {avg_base_ranking_loss_interval:.8f}")
                 
                 
                 
@@ -637,12 +929,12 @@ def main():
                 model.train()
         
         avg_val_loss = avg_val_loss_per_epoch / max(log_step_per_epoch, 1)
-        if scheduler_type != "OneCycleLR":
+        if scheduler_type == "ReduceLROnPlateau":
             learning_rate_scheduler.step(avg_val_loss)
         
         # Only print on rank 0
         if fabric.global_rank == 0:
-            print(f"Epoch {epoch}/{epochs}, Elapsed time: {time.time() - epoch_start:.2f}s, Train loss: {avg_loss:.8f} —  Val loss: {avg_val_loss:.8f} —  Val abs error mean: {abs_errors.mean():.8f}")
+            print(f"Epoch {epoch}/{epochs}, Elapsed time: {time.time() - epoch_start:.2f}s, Train loss: {avg_loss:.8f} —  Val loss: {avg_val_loss:.8f} —  Val abs error mean: {abs_errors.mean():.8f} - regression loss: {avg_regression_loss_interval:.8f} - ranking loss: {avg_base_ranking_loss_interval:.8f}")
 
         # 7) Save checkpoint (only on rank 0)
         if epoch % 5 == 0:
@@ -658,7 +950,9 @@ def main():
         print("Training complete.")
 
 def run_validation(model, val_loader, base_criterion, device, weighted_loss, 
-                  add_ranking_loss=False, spearman_tau=0.02, current_ranking_lambda=1.0):
+                  add_ranking_loss=False, spearman_tau=0.02, current_ranking_lambda=1.0, 
+                  ranking_loss_type='one_minus_rho', lambda_min=0.2, lambda_max=10.0, 
+                  lambda_update_every=8, lambda_eta=0.25, lambda_ema_alpha=0.97):
     """
     Enhanced validation function that computes the same losses as training:
     - Regression loss
@@ -667,8 +961,6 @@ def run_validation(model, val_loader, base_criterion, device, weighted_loss,
     - Average DockQ
     """
     model.eval()
-    val_preds  = []
-    val_labels = []
     val_loss   = 0.0
     val_count  = 0
     
@@ -676,7 +968,15 @@ def run_validation(model, val_loader, base_criterion, device, weighted_loss,
     val_regression_loss = 0.0
     val_ranking_loss = 0.0
     val_avg_dockq = 0.0
-    
+    val_rho_soft_per_complex = []
+    val_true_rho_per_complex = []
+    val_base_rho_soft_per_complex = [] #the distance between rho and baseline rho
+    val_base_true_rho_per_complex = [] #the distance between true rho and baseline true rho
+    val_delta_rho_per_complex = [] #the distance between rho and baseline rho
+
+    per_complex_points = defaultdict(lambda: {"true": [], "model": [], "base": [], 'soft_rho': [], 'true_rho': [], 'baseline_soft_rho': [], 'baseline_true_rho': []})
+
+    complex_ids = set()
     with torch.no_grad():
         for batch in val_loader:
             feats  = batch['features'].to(device)
@@ -684,6 +984,9 @@ def run_validation(model, val_loader, base_criterion, device, weighted_loss,
             labels = batch['label'].to(device) # Already logit transformed
             weights= batch['weight'].to(device)  # still available
             complex_id = batch['complex_id']
+            tmp_complex_ids = set(complex_id.flatten().tolist())
+            complex_ids.update(tmp_complex_ids)
+            ranking_score = batch['ranking_score'].to(device)
 
             logits = model(feats, lengths)
             logits = torch.clamp(logits, min=-100.0, max=100.0)
@@ -697,16 +1000,33 @@ def run_validation(model, val_loader, base_criterion, device, weighted_loss,
             
             # =============== RANKING LOSS (if enabled) ===============
             base_ranking_loss = 0.0
-            if add_ranking_loss and logits.size(1) > 1:
-                pred_sig = torch.sigmoid(logits)
-                true_sig = torch.sigmoid(labels)
+            pred_sig = torch.sigmoid(logits) # use the predicted dockQ as the predicted label
+            true_sig = torch.sigmoid(labels) # use the true dockQ as the true label
+            base_sig = torch.clamp(ranking_score, 1e-7, 1 - 1e-7) #using the ranking score as the baseline, aka what AF gives as official ranking
+
+            #append the true, model, and base arrays to the per_complex_points dictionary
+            true_sig_flat = true_sig.detach().cpu().numpy().flatten()
+            pred_sig_flat = pred_sig.detach().cpu().numpy().flatten()
+            base_sig_flat = base_sig.detach().cpu().numpy().flatten()
+            
+            for c in tmp_complex_ids:
                 
+                per_complex_points[str(c)]["true"].extend(true_sig_flat.tolist())
+                per_complex_points[str(c)]["model"].extend(pred_sig_flat.tolist())
+                per_complex_points[str(c)]["base"].extend(base_sig_flat.tolist())
+
+            if add_ranking_loss and logits.size(1) > 1:
                 # Compute ranking relevance weight (same as training)
                 with torch.no_grad():
                     true_sig_std = true_sig.std(dim=1, keepdim=True) + 1e-6
                     ranking_relevance_weight = torch.clamp(true_sig_std / 0.07, min=0.0, max=1.0)
-                
-                base_spearman_loss_terms = fisher_spearman_soft_loss(pred_sig, true_sig, tau=spearman_tau)
+                if ranking_loss_type == 'one_minus_rho':
+                    rho_soft_terms = soft_spearman_loss(pred_sig, true_sig, loss_type='one_minus_rho', tau=spearman_tau)
+                    base_spearman_loss_terms = rho_soft_terms
+                elif ranking_loss_type == 'fisher':
+                    base_spearman_loss_terms = soft_spearman_loss(pred_sig, true_sig, loss_type='fisher', tau=spearman_tau)
+                else:
+                    raise ValueError(f"Invalid ranking loss type: {ranking_loss_type}")
                 base_ranking_loss = (base_spearman_loss_terms * ranking_relevance_weight.squeeze()).mean()
             
             # =============== COMBINED LOSS ===============
@@ -716,7 +1036,7 @@ def run_validation(model, val_loader, base_criterion, device, weighted_loss,
             
             # =============== AVERAGE DOCKQ ===============
             avg_dockq = torch.sigmoid(labels).mean().item()
-            
+
             # Accumulate losses
             val_loss += combined_loss.item()
             val_regression_loss += regression_loss.item()
@@ -725,40 +1045,78 @@ def run_validation(model, val_loader, base_criterion, device, weighted_loss,
             val_avg_dockq += avg_dockq
             val_count += feats.size(0)
 
-            # convert back labels and logits to 0-1 for metrics
-            # Labels are already logit transformed, so apply sigmoid to convert back for comparison
-            labels_original_scale = torch.sigmoid(labels)
-            logits_original_scale = torch.sigmoid(logits)
-
-            #clipping for extreme sigmoid outputs
-            labels_original_scale = torch.clamp(labels_original_scale, min=1e-7, max=1-1e-7)
-            logits_original_scale = torch.clamp(logits_original_scale, min=1e-7, max=1-1e-7)
-            
-            val_preds.extend(logits_original_scale.cpu().numpy().flatten())
-            val_labels.extend(labels_original_scale.cpu().numpy().flatten())
-
+    #convert values to numpy arrays
+    for c in complex_ids:
+        per_complex_points[str(c)]["true"] = np.array(per_complex_points[str(c)]["true"])
+        per_complex_points[str(c)]["model"] = np.array(per_complex_points[str(c)]["model"])
+        per_complex_points[str(c)]["base"] = np.array(per_complex_points[str(c)]["base"])
+        
     # Average the losses
     avg_val_loss = val_loss / len(val_loader)
     avg_val_regression_loss = val_regression_loss / len(val_loader)
     avg_val_ranking_loss = val_ranking_loss / len(val_loader) if add_ranking_loss else 0.0
     avg_val_dockq = val_avg_dockq / len(val_loader)
+
+
+    # =============== SOFT SPEARMAN RHO (per complex) ===============
+    soft_rho_per_complex = []
+    true_rho_per_complex = []
+    baseline_soft_rho_per_complex = []
+    baseline_true_rho_per_complex = []
+    for c in complex_ids:
+
+        true_rho_per_complex_this, soft_rho_per_complex_this = calculate_spearman(per_complex_points[str(c)]["model"], per_complex_points[str(c)]["true"])
+        soft_rho_per_complex.append(soft_rho_per_complex_this)
+        true_rho_per_complex.append(true_rho_per_complex_this)
+
+        baseline_true_rho_per_complex_this, baseline_soft_rho_per_complex_this = calculate_spearman(per_complex_points[str(c)]["base"], per_complex_points[str(c)]["true"])
+        baseline_soft_rho_per_complex.append(baseline_soft_rho_per_complex_this)
+        baseline_true_rho_per_complex.append(baseline_true_rho_per_complex_this)
+        
+        per_complex_points[str(c)]["soft_rho"].append(soft_rho_per_complex_this)
+        per_complex_points[str(c)]["true_rho"].append(true_rho_per_complex_this)
+        per_complex_points[str(c)]["baseline_soft_rho"].append(baseline_soft_rho_per_complex_this)
+        per_complex_points[str(c)]["baseline_true_rho"].append(baseline_true_rho_per_complex_this)
     
+    soft_rho_per_complex = np.array(soft_rho_per_complex)
+    true_rho_per_complex = np.array(true_rho_per_complex)
+    baseline_soft_rho_per_complex = np.array(baseline_soft_rho_per_complex)
+    baseline_true_rho_per_complex = np.array(baseline_true_rho_per_complex)
+    delta_soft_rho_per_complex = (soft_rho_per_complex - baseline_soft_rho_per_complex)
+    delta_true_rho_per_complex = (true_rho_per_complex - baseline_true_rho_per_complex)
+
     return {
         'loss': avg_val_loss,
         'regression_loss': avg_val_regression_loss,
         'ranking_loss': avg_val_ranking_loss,
         'avg_dockq': avg_val_dockq,
-        'preds': np.array(val_preds),
-        'labels': np.array(val_labels)
+
+        'rho_soft_per_complex': soft_rho_per_complex,
+        'rho_true_per_complex': true_rho_per_complex,
+        'rho_baseline_per_complex': baseline_soft_rho_per_complex,
+        'soft_rho_mean': float(soft_rho_per_complex.mean()),
+        'true_rho_mean': float(true_rho_per_complex.mean()),
+        'baseline_rho_mean': float(baseline_soft_rho_per_complex.mean()),
+        'delta_soft_rho_per_complex': delta_soft_rho_per_complex,
+        'delta_true_rho_per_complex': delta_true_rho_per_complex,
+        'delta_soft_rho_mean': float(delta_soft_rho_per_complex.mean()),
+        'delta_true_rho_mean': float(delta_true_rho_per_complex.mean()),
+
+        'per_complex_points': dict(per_complex_points),
     }
 
-def train_step(model, batch, optimizer, base_criterion, device, 
+def train_step(model, batch, optimizer, base_criterion, device,
+               step,
                weighted_loss, adaptive_weight,
-               add_ranking_loss, spearman_tau, 
+               add_ranking_loss, spearman_tau, ranking_loss_type,
                current_ranking_lambda,      # Lambda from previous step/initial (EMA smoothed)
-               lambda_ema_alpha,            # Smoothing factor for lambda EMA
-               fabric=None                  # Lightning Fabric for autocast and backward
-               ):
+               fabric=None,                  # Lightning Fabric for autocast and backward
+               lambda_min=0.2,                # Minimum lambda value
+               lambda_max=10.0,              # Maximum lambda value
+               lambda_update_every=8,        # Update lambda every 8 steps
+               lambda_eta=0.25,              # Gentle multiplicative update
+               lambda_ema_alpha=0.97,
+               ):                        
     """
     Fabric-safe training step:
       - single forward (under autocast)
@@ -823,7 +1181,8 @@ def train_step(model, batch, optimizer, base_criterion, device,
     def compute_losses():
                    
         logits = model(feats, lengths)  # [B, K] predictions in logit space
-
+        logits = torch.clamp(logits, min=-100.0, max=100.0)
+        
         # regression loss on logits vs labels (already in logit space)
         regression_losses = base_criterion(logits, labels)
 
@@ -851,49 +1210,52 @@ def train_step(model, batch, optimizer, base_criterion, device,
             pred_sig = torch.sigmoid(logits)
             true_sig = torch.sigmoid(labels)
             with torch.no_grad():
-                true_sig_std = true_sig.std(dim=1, keepdim=True) + 1e-6
-                ranking_relevance_weight = torch.clamp(true_sig_std / 0.07, min=0.0, max=1.0)
-            base_spearman_loss_terms = fisher_spearman_soft_loss(pred_sig, true_sig, tau=spearman_tau)  # [B]
+                true_sig_std = true_sig.std(dim=1, keepdim=True)
+                tmp_eps = 1e-3
+                gate = (true_sig_std > const_eps).float()
+                ranking_relevance_weight = gate * torch.clamp(true_sig_std / 0.07, max=1.0)
+            if ranking_loss_type == 'one_minus_rho':
+                rho_soft_terms = soft_spearman_loss(pred_sig, true_sig, loss_type=ranking_loss_type, tau=spearman_tau)
+                base_spearman_loss_terms = rho_soft_terms  # [B]
+            elif ranking_loss_type == 'fisher':
+                base_spearman_loss_terms = soft_spearman_loss(pred_sig, true_sig, loss_type=ranking_loss_type, tau=spearman_tau)  # [B]
+            else:
+                raise ValueError(f"Invalid ranking loss type: {ranking_loss_type}")
             mean_base_ranking_loss = (base_spearman_loss_terms * ranking_relevance_weight.squeeze()).mean()
             base_ranking_loss_for_log = float(mean_base_ranking_loss.detach())
 
     grad_norm_reg_val  = grad_norm_via_fabric_probe(regression_loss, params, fabric, optimizer)
     grad_norm_rank_val = grad_norm_via_fabric_probe(mean_base_ranking_loss, params, fabric, optimizer) if (add_ranking_loss and logits.size(1) > 1) else 0.0
 
-    # ------------------- dynamic lambda update (EMA on ideal ratio) -------------------
+    # ------------------- dynamic lambda update (EMA of grad-norm ratio) -------------------
+    # Goal: keep ||∇L_reg|| and ||∇L_rank|| on a similar scale.
+    # We (a) estimate a ratio r = g_reg/g_rank, (b) smooth it with EMA,
+    # (c) adjust λ multiplicatively and (d) clamp to safe bounds.
     updated_lambda_for_next_step = current_ranking_lambda
+    updated_ema_ratio_state = lambda_ema_alpha
+
     if add_ranking_loss and logits.size(1) > 1:
+        # Update only every M steps to reduce noise sensitivity
+        if (fabric.global_rank == 0) and (step % lambda_update_every == 0):
+            eps = 1e-8
 
-        # compute a safe ratio
-        eps_abs = 1e-6
-        eps_rel = 1e-3  # relative to reg norm
-        denom = max(grad_norm_rank_val, eps_abs, eps_rel * grad_norm_reg_val)
+            # 1) Raw ratio of gradient norms (bounded to avoid outliers)
+            ratio = (grad_norm_reg_val + eps) / (grad_norm_rank_val + eps)
+            ratio = float(np.clip(ratio, 0.2, 5.0))      # keep ratio near 1
 
-        ratio = grad_norm_reg_val / denom  # >= 1 by construction
-        # clamp ratio; keep it sane
-        ratio = float(min(max(ratio, 1e-3), 1e3))
+            # 2) Smooth the ratio with EMA so transient batches don't jerk λ around
+            updated_ema_ratio_state = (
+                lambda_ema_alpha * updated_ema_ratio_state + (1.0 - lambda_ema_alpha) * ratio
+            )
 
-        # log-space EMA toward target ratio
-        log_lambda   = float(np.log(max(current_ranking_lambda, 1e-8)))
-        log_target   = float(np.log(ratio * max(current_ranking_lambda, 1e-8)))
-        alpha = lambda_ema_alpha  # e.g. 0.9
-        log_new = alpha * log_lambda + (1 - alpha) * log_target
+            # 3) Multiplicative update with a gentle exponent (λ ← λ * r_ema^eta)
+            new_lambda = current_ranking_lambda * (updated_ema_ratio_state ** lambda_eta)
 
-        # optional hysteresis: if rank grad is tiny, decay λ
-        tiny_rank = grad_norm_rank_val < max(1e-6, 1e-3 * grad_norm_reg_val)
-        if tiny_rank:
-            log_new = log_lambda + np.log(0.5)  # decay by 0.5 instead of exploding
+            # 4) Final safety clamp to keep tasks balanced
+            new_lambda = float(np.clip(new_lambda, lambda_min, lambda_max))
 
-        # final clamp for λ
-        new_lambda = float(np.exp(log_new))
-        new_lambda = float(min(max(new_lambda, 0.2), 10.0))
-
-        updated_lambda_for_next_step = new_lambda
-
-        # Print AFTER clamp so logs match what you actually use
-        # print(f"Ideal ratio (clamped): {ratio}")
-        # print(f"Current ranking lambda: {current_ranking_lambda}")
-        # print(f"Updated lambda for next step: {updated_lambda_for_next_step}")
+            updated_lambda_for_next_step = new_lambda
+    # -------------------------------------------------------------------
 
     # ------------------- final combined backward + step -------------------
     # Build the combined loss using the *current* lambda (as in your code)
