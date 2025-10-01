@@ -7,10 +7,11 @@ data:
   feature_transform: true
   feature_centering: true
   batch_size_per_gpu: 2 #8 max batch for sum aggregators #6 max batch for concat_stats aggregator #4 max batch for attn_pool aggregator
-  num_workers: 16
+  num_workers: 8
   samples_per_complex: 5
-  use_interchain_ca_distances: false
-  
+  use_interchain_ca_distances: true
+  use_interchain_pae: true
+
 model:
   input_dim: 4
   aggregator: concat_stats_by_set_size
@@ -19,14 +20,19 @@ model:
 
 training:
   adaptive_weight: true
-  epochs: 150
-  lr: !!float 1e-3
+  epochs: 250
+  lr: !!float 5e-3
   weight_decay: !!float 1e-5
   smooth_l1_beta: 0.5
   weighted_loss: true
   bucket_balance: false
   num_buckets: 4
   seed: 42
-  lr_scheduler_type: "WarmupHoldLinear"  # or "ReduceLROnPlateau" or "WarmupHoldLinear"
+  lr_scheduler_type: "OneCycleLR"  # or "ReduceLROnPlateau" or "WarmupHoldLinear"
   add_ranking_loss: true      # Whether to add the ranking loss
+  add_distance_preservation_loss: true
   ranking_loss_type: "one_minus_rho"  # "fisher" or "one_minus_rho"
+  distance_loss_start_epoch: 1
+  distance_lambda_start: 1.0
+  distance_lambda_min: 0.2
+  distance_lambda_max: 10.0

@@ -3,12 +3,12 @@
 compare_models_and_baseline.py
 
 A comprehensive tool to compare multiple trained DeepSet models (or other compatible models)
-and a baseline ranking_confidence score against ground truth DockQ and TM scores.
+and a baseline ranking_score score against ground truth DockQ and TM scores.
 
 Functionality:
 - Loads models specified in a text file.
 - Uses a primary manifest (from the first model's config) for consistent dataset splits
-  and ground truth data (DockQ, TM scores, ranking_confidence baseline).
+  and ground truth data (DockQ, TM scores, ranking_score baseline).
 - Evaluates each model and the baseline across specified data splits (e.g., train, val, test).
 - Computes global and per-complex correlation metrics (Pearson r, Spearman ρ) and MSE.
 - Generates various visualizations:
@@ -564,7 +564,7 @@ def main():
         print(f"Error reading primary manifest {primary_manifest_path}: {e}")
         return
 
-    required_cols = ['complex_id', 'label', 'tm_normalized', 'ranking_confidence', 'split']
+    required_cols = ['complex_id', 'label', 'tm_normalized', 'ranking_score', 'split']
     if not all(col in main_df_original.columns for col in required_cols):
         missing = [col for col in required_cols if col not in main_df_original.columns]
         print(f"Error: Primary manifest {primary_manifest_path} is missing required columns: {missing}")
@@ -579,7 +579,7 @@ def main():
     if primary_manifest_path and os.path.exists(primary_manifest_path):
         try:
             main_df_for_baseline_lookup = pd.read_csv(primary_manifest_path)
-            required_cols = ['complex_id', 'label', 'tm_normalized', 'ranking_confidence', 'split']
+            required_cols = ['complex_id', 'label', 'tm_normalized', 'ranking_score', 'split']
             if not all(col in main_df_for_baseline_lookup.columns for col in required_cols):
                 missing = [col for col in required_cols if col not in main_df_for_baseline_lookup.columns]
                 print(f"Warning: Primary manifest {primary_manifest_path} is missing required columns: {missing}. Baseline might be affected.")
@@ -601,7 +601,7 @@ def main():
             split_df_for_baseline = main_df_for_baseline_lookup[main_df_for_baseline_lookup['split'] == split].reset_index(drop=True)
             if not split_df_for_baseline.empty:
                 all_results_data[baseline_id][split] = {
-                    "predictions": split_df_for_baseline['ranking_confidence'].values,
+                    "predictions": split_df_for_baseline['ranking_score'].values,
                     "true_dockq": split_df_for_baseline['label'].values, # Assuming these are already [0,1] or this needs sigmoid too
                     "true_tm": split_df_for_baseline['tm_normalized'].values,
                     "complex_ids": split_df_for_baseline['complex_id'].tolist(),

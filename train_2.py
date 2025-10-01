@@ -129,8 +129,9 @@ def soft_spearman_loss(pred, target, loss_type='one_minus_rho', tau=0.2):
     sr_pred = pairwise_soft_rank(pred,   tau)   # [B,K]
     sr_true = pairwise_soft_rank(target, tau)   # [B,K]
     
-    mse = (sr_pred - sr_true).pow(2).sum(dim=-1) # per complex [B]
-    
+    # mse = (sr_pred - sr_true).pow(2).sum(dim=-1) # per complex [B]
+    mse = (sr_pred - sr_true).pow(2).mean(dim=-1) # per complex [B]
+
     denominator = K * (K**2 - 1)
     # If K < 2, denominator could be 0. Handled by K < 2 check above.
     # However, if K is exactly 0 or 1 due to an issue, ensure no division by zero.
@@ -149,12 +150,12 @@ def soft_spearman_loss(pred, target, loss_type='one_minus_rho', tau=0.2):
     else:
         raise ValueError(f"Invalid loss type: {loss_type}")
 
-    return loss
+    return loss.mean()
 
 def distance_preservation_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """
     pred, target: [B, K]
-    Returns: [B] loss per complex
+    Returns: [B] loss per complex, averaged over batch
     Computes sum of squared errors between pairwise absolute distances of pred and target.
     """
     B, K = pred.shape
@@ -173,7 +174,7 @@ def distance_preservation_loss(pred: torch.Tensor, target: torch.Tensor) -> torc
 
     # Sum squared errors per complex (no mean across batch)
     loss_per_complex = (diff ** 2).sum(dim=1)  # [B]
-    return loss_per_complex
+    return loss_per_complex.mean()
 
 def main():
     # 1) Setup argument parsing
@@ -362,17 +363,9 @@ def main():
     distance_loss_start_epoch = cfg.training.get('distance_loss_start_epoch', 1)
     spearman_tau        = cfg.training.get('spearman_tau', 0.02)
     ranking_loss_type   = cfg.training.get('ranking_loss_type', 'one_minus_rho')  # 'fisher' or 'one_minus_rho'
-    # Ranking loss parameters
-    lambda_start        = cfg.training.get('lambda_start', 1.0)
-    lambda_min          = cfg.training.get('lambda_min', 0.2)
-    lambda_max          = cfg.training.get('lambda_max', 10.0)
-    lambda_update_every = cfg.training.get('lambda_update_every', 8)
-    lambda_eta          = cfg.training.get('lambda_eta', 0.25)
-    lambda_ema_alpha    = cfg.training.get('lambda_ema_alpha', 0.97)
-    # Distance preservation loss parameters
-    distance_lambda_start = cfg.training.get('distance_lambda_start', 1.0)
-    distance_lambda_min   = cfg.training.get('distance_lambda_min', 0.2)
-    distance_lambda_max   = cfg.training.get('distance_lambda_max', 10.0)
+    # Fixed lambda parameters (replacing dynamic EMA-based updating)
+    ranking_lambda = cfg.training.get('ranking_lambda', 10.0)
+    distance_lambda = cfg.training.get('distance_lambda', 0.1)
     
     feature_transform   = cfg.data.feature_transform
     feature_centering   = cfg.data.get('feature_centering', False)
@@ -477,26 +470,6 @@ def main():
 
     # Setup with Fabric for distributed training
     model, optimizer = fabric.setup(model, optimizer)
-
-    ### DEBUG STEPS FOR MULTI NODES SYNCING ###
-    def param_checksum(m):
-        s1 = torch.tensor(0.0, device=fabric.device)
-        s2 = torch.tensor(0.0, device=fabric.device)
-        with torch.no_grad():
-            for p in m.parameters():
-                if p is not None:
-                    pf = p.float()
-                    s1 += pf.sum()
-                    s2 += (pf**2).sum()
-        s1_all = fabric.all_gather(s1).cpu().numpy()
-        s2_all = fabric.all_gather(s2).cpu().numpy()
-        return s1_all, s2_all
-
-    s1_all, s2_all = param_checksum(model)
-    if fabric.global_rank == 0:
-        print("INIT checksum s1 per-rank:", s1_all)
-        print("INIT checksum s2 per-rank:", s2_all)
-    ### END DEBUG STEPS FOR MULTI NODES SYNCING ###
     
     train_loader = fabric.setup_dataloaders(train_loader, use_distributed_sampler=False)
     val_loader = fabric.setup_dataloaders(val_loader, use_distributed_sampler=False)
@@ -673,16 +646,12 @@ def main():
     #We define a step as a batch (a gradient step)
     step = 0
     
-    # Initialize dynamic lambda for ranking loss
-    dynamic_ranking_lambda = lambda_start # Starts with the config value
-    # Initialize dynamic lambda for distance preservation loss  
-    dynamic_distance_lambda = distance_lambda_start
 
     # Initialize persistent wandb tables for accumulating plots across epochs (only on rank 0)
     if fabric.global_rank == 0:
-        all_complexes_table = wandb.Table(columns=["epoch", "image"])
-        delta_rho_table = wandb.Table(columns=["epoch", "image"])
-        per_complex_table = wandb.Table(columns=["epoch", "complex_id", "image"])
+        all_complexes_table = wandb.Table(columns=["epoch", "image"], log_mode= 'INCREMENTAL')
+        delta_rho_table = wandb.Table(columns=["epoch", "image"], log_mode= 'INCREMENTAL')
+        per_complex_table = wandb.Table(columns=["epoch", "complex_id", "image"], log_mode= 'INCREMENTAL')
 
 
     for epoch in tqdm(range(start_epoch, epochs + 1), desc="Epochs", disable=fabric.global_rank != 0):
@@ -718,25 +687,15 @@ def main():
             step += 1
             combined_loss_val, current_batch_size, avg_dockq, \
             current_regression_loss, current_base_ranking_loss_val, current_base_distance_loss_val, \
-            current_grad_norm_reg, current_grad_norm_rank, current_grad_norm_distance, \
-            updated_dynamic_ranking_lambda, updated_dynamic_distance_lambda = train_step(
+            current_grad_norm_reg, current_grad_norm_rank, current_grad_norm_distance = train_step(
                 model, batch, optimizer, base_criterion, device, 
                 step,
                 weighted_loss, adaptive_weight,
                 add_rank_this_epoch, add_distance_this_epoch, spearman_tau, ranking_loss_type,
-                current_ranking_lambda=dynamic_ranking_lambda, # Pass current lambda
-                current_distance_lambda=dynamic_distance_lambda, # Pass current distance lambda
-                fabric=fabric,  # Pass fabric for autocast and backward
-                lambda_min=lambda_min,
-                lambda_max=lambda_max,
-                lambda_update_every=lambda_update_every,
-                lambda_eta=lambda_eta,
-                lambda_ema_alpha=lambda_ema_alpha,
-                distance_lambda_min=distance_lambda_min,
-                distance_lambda_max=distance_lambda_max
+                ranking_lambda=ranking_lambda, # Use fixed ranking lambda
+                distance_lambda=distance_lambda, # Use fixed distance lambda
+                fabric=fabric  # Pass fabric for autocast and backward
             )
-            dynamic_ranking_lambda = updated_dynamic_ranking_lambda # Update lambda for next step
-            dynamic_distance_lambda = updated_dynamic_distance_lambda # Update distance lambda for next step
 
             # Update learning rate per step for schedulers that are step-wise
             if scheduler_type in ("OneCycleLR", "WarmupHoldLinear"):
@@ -782,16 +741,9 @@ def main():
             add_ranking_loss=add_rank_this_epoch, 
             add_distance_preservation_loss=add_distance_this_epoch,
             spearman_tau=spearman_tau,
-            current_ranking_lambda=dynamic_ranking_lambda,
-            current_distance_lambda=dynamic_distance_lambda,
-            ranking_loss_type=ranking_loss_type,
-            lambda_min=lambda_min,
-            lambda_max=lambda_max,
-            lambda_update_every=lambda_update_every,
-            lambda_eta=lambda_eta,
-            lambda_ema_alpha=lambda_ema_alpha,
-            distance_lambda_min=distance_lambda_min,
-            distance_lambda_max=distance_lambda_max
+            ranking_lambda=ranking_lambda,
+            distance_lambda=distance_lambda,
+            ranking_loss_type=ranking_loss_type
         )
         
         val_loss_scalar = float(val_results['loss'])
@@ -959,24 +911,19 @@ def main():
                 "val/abs_error_q75": float(np.percentile(abs_errors, 75)),
                 "val/abs_error_max":  float(abs_errors.max()),
                 "val/epoch": epoch,
-                
-                # New validation tables (only include if they have data)
-                "val/per_complex_pred_vs_target": per_complex_table,
-                "val/all_complexes_pred_vs_target": all_complexes_table,
-                "val/delta_rho_vs_baseline": delta_rho_table,
             }
             
             # Add ranking loss metrics if enabled
             if add_rank_this_epoch:
                 val_log_dict["val/ranking_loss"] = val_results['ranking_loss']
                 val_log_dict["val/reg_vs_rank_loss_ratio"] = val_results['regression_loss'] / (val_results['ranking_loss'] + 1e-8)
-                val_log_dict["val/dynamic_ranking_lambda"] = dynamic_ranking_lambda
+                val_log_dict["val/ranking_lambda"] = ranking_lambda
             
             # Add distance loss metrics if enabled
             if add_distance_this_epoch:
                 val_log_dict["val/distance_loss"] = val_results['distance_loss']
                 val_log_dict["val/reg_vs_distance_loss_ratio"] = val_results['regression_loss'] / (val_results['distance_loss'] + 1e-8)
-                val_log_dict["val/dynamic_distance_lambda"] = dynamic_distance_lambda
+                val_log_dict["val/distance_lambda"] = distance_lambda
             
             # Create training log dictionary
             train_log_dict = {
@@ -990,8 +937,8 @@ def main():
                 "train/grad_norm_distance": avg_epoch_grad_norm_distance,
                 "train/grad_norm_reg_rank_ratio": avg_epoch_grad_norm_reg / (avg_epoch_grad_norm_rank + 1e-8),
                 "train/grad_norm_reg_distance_ratio": avg_epoch_grad_norm_reg / (avg_epoch_grad_norm_distance + 1e-8),
-                "train/dynamic_ranking_lambda": dynamic_ranking_lambda,
-                "train/dynamic_distance_lambda": dynamic_distance_lambda,
+                "train/ranking_lambda": ranking_lambda,
+                "train/distance_lambda": distance_lambda,
                 "train/training_time_seconds": training_time,
                 "train/validation_time_seconds": validation_time,
                 "train/total_epoch_time_seconds": time.time() - epoch_start,
@@ -1011,7 +958,10 @@ def main():
             combined_log_dict = {**train_log_dict, **val_log_dict}
             
             wandb.log(combined_log_dict, step=epoch)
-
+            wandb.log({
+                "val/per_complex_pred_vs_target": per_complex_table,
+                "val/all_complexes_pred_vs_target": all_complexes_table,
+                "val/delta_rho_vs_baseline": delta_rho_table,})
         # broadcast scalar val_loss to every rank (sum of {x,0,0,...} -> x on all)
         val_loss_t = torch.tensor(val_loss_scalar, device=fabric.device, dtype=torch.float32)
         val_loss_t = fabric.all_reduce(val_loss_t, reduce_op="sum")
@@ -1044,10 +994,8 @@ def main():
 
 def run_validation(model, val_loader, base_criterion, device, weighted_loss, 
                   add_ranking_loss=False, add_distance_preservation_loss=False, 
-                  spearman_tau=0.02, current_ranking_lambda=1.0, current_distance_lambda=1.0,
-                  ranking_loss_type='one_minus_rho', lambda_min=0.2, lambda_max=10.0, 
-                  lambda_update_every=8, lambda_eta=0.25, lambda_ema_alpha=0.97,
-                  distance_lambda_min=0.2, distance_lambda_max=10.0):
+                  spearman_tau=0.02, ranking_lambda=1.0, distance_lambda=1.0,
+                  ranking_loss_type='one_minus_rho'):
     """
     Enhanced validation function that computes the same losses as training:
     - Regression loss
@@ -1099,8 +1047,8 @@ def run_validation(model, val_loader, base_criterion, device, weighted_loss,
             base_ranking_loss = 0.0
             # =============== DISTANCE PRESERVATION LOSS (if enabled) ===============
             base_distance_loss = 0.0
-            pred_sig = logits # use the predicted dockQ as the predicted label
-            true_sig = labels # use the true dockQ as the true label
+            pred_sig = torch.sigmoid(logits) # use the predicted dockQ as the predicted label
+            true_sig = torch.sigmoid(labels) # use the true dockQ as the true label
             base_sig = torch.clamp(ranking_score, 1e-7, 1 - 1e-7) #using the ranking score as the baseline, aka what AF gives as official ranking
 
             #append the true, model, and base arrays to the per_complex_points dictionary
@@ -1136,9 +1084,9 @@ def run_validation(model, val_loader, base_criterion, device, weighted_loss,
             # =============== COMBINED LOSS ===============
             combined_loss = regression_loss
             if add_ranking_loss and logits.size(1) > 1:
-                combined_loss = combined_loss + current_ranking_lambda * base_ranking_loss
+                combined_loss = combined_loss + ranking_lambda * base_ranking_loss
             if add_distance_preservation_loss and logits.size(1) > 1:
-                combined_loss = combined_loss + current_distance_lambda * base_distance_loss
+                combined_loss = combined_loss + distance_lambda * base_distance_loss
             
             # =============== AVERAGE DOCKQ ===============
             avg_dockq = torch.sigmoid(labels).mean().item()
@@ -1219,58 +1167,50 @@ def train_step(model, batch, optimizer, base_criterion, device,
                step,
                weighted_loss, adaptive_weight,
                add_ranking_loss, add_distance_preservation_loss, spearman_tau, ranking_loss_type,
-               current_ranking_lambda,      # Lambda from previous step/initial (EMA smoothed)
-               current_distance_lambda,     # Distance lambda from previous step/initial
-               fabric=None,                  # Lightning Fabric for autocast and backward
-               lambda_min=0.2,                # Minimum lambda value
-               lambda_max=10.0,              # Maximum lambda value
-               lambda_update_every=8,        # Update lambda every 8 steps
-               lambda_eta=0.25,              # Gentle multiplicative update
-               lambda_ema_alpha=0.97,
-               distance_lambda_min=0.2,     # Minimum distance lambda value
-               distance_lambda_max=10.0,    # Maximum distance lambda value
-               ):                        
+               ranking_lambda=1.0,          # Fixed ranking lambda
+               distance_lambda=1.0,         # Fixed distance lambda
+               fabric=None):                # Lightning Fabric for autocast and backward                        
     """
-    Fabric-safe training step:
+    Fabric-safe training step with fixed lambdas:
       - single forward (under autocast)
       - probe backprops to get ||grad(L_reg)||, ||grad(L_rank)||, ||grad(L_distance)|| without DDP sync
-      - build total loss with current_ranking_lambda and current_distance_lambda
+      - build total loss with fixed ranking_lambda and distance_lambda
       - real Fabric backward + optimizer step
     """
 
-    def grad_norm_via_fabric_probe(loss_tensor, params, fabric, optimizer):
-        """
-        Fabric-safe per-loss grad-norm probe:
-        - uses fabric.no_backward_sync(model) to avoid DDP all-reduce
-        - uses fabric.backward(loss, retain_graph=True) to satisfy Fabric
-        - reads .grad, computes global L2, then zeroes grads immediately
-        - returns a finite Python float (DDP-averaged)
-        """
-        if (loss_tensor is None) or (not loss_tensor.requires_grad) or (len(params) == 0):
-            return 0.0
+    # def grad_norm_via_fabric_probe(loss_tensor, params, fabric, optimizer):
+    #     """
+    #     Fabric-safe per-loss grad-norm probe:
+    #     - uses fabric.no_backward_sync(model) to avoid DDP all-reduce
+    #     - uses fabric.backward(loss, retain_graph=True) to satisfy Fabric
+    #     - reads .grad, computes global L2, then zeroes grads immediately
+    #     - returns a finite Python float (DDP-averaged)
+    #     """
+    #     if (loss_tensor is None) or (not loss_tensor.requires_grad) or (len(params) == 0):
+    #         return 0.0
 
-        # 1) local backward w/o sync -> fills p.grad locally
-        with fabric.no_backward_sync(model):
-            optimizer.zero_grad(set_to_none=True)
-            fabric.backward(loss_tensor, retain_graph=True)
+    #     # 1) local backward w/o sync -> fills p.grad locally
+    #     with fabric.no_backward_sync(model):
+    #         optimizer.zero_grad(set_to_none=True)
+    #         fabric.backward(loss_tensor, retain_graph=True)
 
-        # 2) compute L2 over current grads in fp32 (ignore NaN/Inf terms)
-        total_sq = torch.zeros((), device=params[0].device, dtype=torch.float32)
-        for p in params:
-            g = p.grad
-            if g is not None:
-                g32 = g.detach().to(torch.float32)
-                g32 = torch.nan_to_num(g32, nan=0.0, posinf=0.0, neginf=0.0)
-                total_sq = total_sq + g32.pow(2).sum()
-        gn = total_sq.sqrt()
+    #     # 2) compute L2 over current grads in fp32 (ignore NaN/Inf terms)
+    #     total_sq = torch.zeros((), device=params[0].device, dtype=torch.float32)
+    #     for p in params:
+    #         g = p.grad
+    #         if g is not None:
+    #             g32 = g.detach().to(torch.float32)
+    #             g32 = torch.nan_to_num(g32, nan=0.0, posinf=0.0, neginf=0.0)
+    #             total_sq = total_sq + g32.pow(2).sum()
+    #     gn = total_sq.sqrt()
 
-        # 3) agree across ranks (mean is fine; we only need consistency)
-        gn = fabric.all_reduce(gn, reduce_op="mean")
+    #     # 3) agree across ranks (mean is fine; we only need consistency)
+    #     gn = fabric.all_reduce(gn, reduce_op="mean")
 
-        # 4) clean up probe grads to avoid contaminating the real step
-        optimizer.zero_grad(set_to_none=True)
+    #     # 4) clean up probe grads to avoid contaminating the real step
+    #     optimizer.zero_grad(set_to_none=True)
 
-        return float(torch.clamp(gn, min=1e-12))
+    #     return float(torch.clamp(gn, min=1e-12))
 
     # --------------- move batch to device ---------------
     feats   = batch['features'].to(device)
@@ -1288,7 +1228,7 @@ def train_step(model, batch, optimizer, base_criterion, device,
         fabric.backward(loss, **kw)
 
 
-    optimizer.zero_grad(set_to_none=True)
+    optimizer.zero_grad()
 
     # ------------------- forward + base losses -------------------
     def compute_losses():
@@ -1326,11 +1266,13 @@ def train_step(model, batch, optimizer, base_criterion, device,
         if add_ranking_loss and logits.size(1) > 1:
             pred_sig = torch.sigmoid(logits)
             true_sig = torch.sigmoid(labels)
+            # Continuous weighting approach
+
             with torch.no_grad():
                 true_sig_std = true_sig.std(dim=1, keepdim=True)
                 tmp_eps = 1e-3
                 gate = (true_sig_std > const_eps).float()
-                ranking_relevance_weight = gate * torch.clamp(true_sig_std / 0.07, max=1.0)
+                ranking_relevance_weight = gate * torch.clamp(true_sig_std / 0.07, min=0.0, max=1.0)
             if ranking_loss_type == 'one_minus_rho':
                 rho_soft_terms = soft_spearman_loss(pred_sig, true_sig, loss_type=ranking_loss_type, tau=spearman_tau)
                 base_spearman_loss_terms = rho_soft_terms  # [B]
@@ -1342,77 +1284,25 @@ def train_step(model, batch, optimizer, base_criterion, device,
             base_ranking_loss_for_log = float(mean_base_ranking_loss.detach())
 
         if add_distance_preservation_loss and logits.size(1) > 1:
-            pred_sig = logits
-            true_sig = labels
+            # pred_sig = logits
+            # true_sig = labels
+            pred_sig = torch.sigmoid(logits)
+            true_sig = torch.sigmoid(labels)
             distance_loss_terms = distance_preservation_loss(pred_sig, true_sig)  # [B]
             mean_base_distance_loss = distance_loss_terms.mean()
             base_distance_loss_for_log = float(mean_base_distance_loss.detach())
 
-    grad_norm_reg_val  = grad_norm_via_fabric_probe(regression_loss, params, fabric, optimizer)
-    grad_norm_rank_val = grad_norm_via_fabric_probe(mean_base_ranking_loss, params, fabric, optimizer) if (add_ranking_loss and logits.size(1) > 1) else 0.0
-    grad_norm_distance_val = grad_norm_via_fabric_probe(mean_base_distance_loss, params, fabric, optimizer) if (add_distance_preservation_loss and logits.size(1) > 1) else 0.0
-
-    # ------------------- dynamic lambda update (EMA of grad-norm ratio) -------------------
-    # Goal: keep ||∇L_reg|| and ||∇L_rank|| on a similar scale.
-    # We (a) estimate a ratio r = g_reg/g_rank, (b) smooth it with EMA,
-    # (c) adjust λ multiplicatively and (d) clamp to safe bounds.
-    updated_ranking_lambda_for_next_step = current_ranking_lambda
-    updated_distance_lambda_for_next_step = current_distance_lambda
-    updated_ema_ratio_state = lambda_ema_alpha
-
-    if add_ranking_loss and logits.size(1) > 1:
-        # Update only every M steps to reduce noise sensitivity
-        if (fabric.global_rank == 0) and (step % lambda_update_every == 0):
-            eps = 1e-8
-
-            # 1) Raw ratio of gradient norms (bounded to avoid outliers)
-            ratio = (grad_norm_reg_val + eps) / (grad_norm_rank_val + eps)
-            ratio = float(np.clip(ratio, 0.2, 5.0))      # keep ratio near 1
-
-            # 2) Smooth the ratio with EMA so transient batches don't jerk λ around
-            updated_ema_ratio_state = (
-                lambda_ema_alpha * updated_ema_ratio_state + (1.0 - lambda_ema_alpha) * ratio
-            )
-
-            # 3) Multiplicative update with a gentle exponent (λ ← λ * r_ema^eta)
-            new_lambda = current_ranking_lambda * (updated_ema_ratio_state ** lambda_eta)
-
-            # 4) Final safety clamp to keep tasks balanced
-            new_lambda = float(np.clip(new_lambda, lambda_min, lambda_max))
-
-            updated_ranking_lambda_for_next_step = new_lambda
-    
-    # Similar dynamic lambda update for distance preservation loss
-    if add_distance_preservation_loss and logits.size(1) > 1:
-        # Update only every M steps to reduce noise sensitivity
-        if (fabric.global_rank == 0) and (step % lambda_update_every == 0):
-            eps = 1e-8
-
-            # 1) Raw ratio of gradient norms (bounded to avoid outliers)
-            ratio = (grad_norm_reg_val + eps) / (grad_norm_distance_val + eps)
-            ratio = float(np.clip(ratio, 0.2, 5.0))      # keep ratio near 1
-
-            # 2) Smooth the ratio with EMA so transient batches don't jerk λ around
-            updated_ema_ratio_state = (
-                lambda_ema_alpha * updated_ema_ratio_state + (1.0 - lambda_ema_alpha) * ratio
-            )
-
-            # 3) Multiplicative update with a gentle exponent (λ ← λ * r_ema^eta)
-            new_distance_lambda = current_distance_lambda * (updated_ema_ratio_state ** lambda_eta)
-
-            # 4) Final safety clamp to keep tasks balanced
-            new_distance_lambda = float(np.clip(new_distance_lambda, distance_lambda_min, distance_lambda_max))
-
-            updated_distance_lambda_for_next_step = new_distance_lambda
-    # -------------------------------------------------------------------
+    # grad_norm_reg_val  = grad_norm_via_fabric_probe(regression_loss, params, fabric, optimizer)
+    # grad_norm_rank_val = grad_norm_via_fabric_probe(mean_base_ranking_loss, params, fabric, optimizer) if (add_ranking_loss and logits.size(1) > 1) else 0.0
+    # grad_norm_distance_val = grad_norm_via_fabric_probe(mean_base_distance_loss, params, fabric, optimizer) if (add_distance_preservation_loss and logits.size(1) > 1) else 0.0
 
     # ------------------- final combined backward + step -------------------
-    # Build the combined loss using the *current* lambda (as in your code)
+    # Build the combined loss using the fixed lambdas
     total_combined_loss = regression_loss
     if add_ranking_loss and logits.size(1) > 1:
-        total_combined_loss = total_combined_loss + current_ranking_lambda * mean_base_ranking_loss
+        total_combined_loss = total_combined_loss + ranking_lambda * mean_base_ranking_loss
     if add_distance_preservation_loss and logits.size(1) > 1:
-        total_combined_loss = total_combined_loss + current_distance_lambda * mean_base_distance_loss
+        total_combined_loss = total_combined_loss + distance_lambda * mean_base_distance_loss
 
     optimizer.zero_grad(set_to_none=True)
     _backward(total_combined_loss)   # Fabric handles AMP/DDP
@@ -1426,7 +1316,7 @@ def train_step(model, batch, optimizer, base_criterion, device,
     
     optimizer.step()
 
-    # ------------------- return (preserve your signature) -------------------
+    # ------------------- return (simplified signature) -------------------
         
     return_values = [
         float(total_combined_loss.detach()),
@@ -1435,11 +1325,9 @@ def train_step(model, batch, optimizer, base_criterion, device,
         float(regression_loss.detach()),
         base_ranking_loss_for_log,
         base_distance_loss_for_log,
-        grad_norm_reg_val,
-        grad_norm_rank_val,
-        grad_norm_distance_val,
-        updated_ranking_lambda_for_next_step,
-        updated_distance_lambda_for_next_step,
+        0,
+        0,
+        0,
     ]
 
     return tuple(return_values)

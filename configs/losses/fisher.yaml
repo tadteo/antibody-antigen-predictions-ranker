@@ -1,5 +1,5 @@
 training:
-  spearman_tau: 0.05
+  spearman_tau: 0.02
   ranking_loss_start_epoch: 1
   lambda_start: 1.0
   lambda_min: 0.2

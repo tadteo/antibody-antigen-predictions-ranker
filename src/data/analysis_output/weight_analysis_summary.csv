@@ -1,0 +1,2 @@
+overall_weight_mean,overall_weight_std,overall_weight_sum,total_samples,train_weight_mean,train_weight_sum,train_sample_count,val_weight_mean,val_weight_sum,val_sample_count
+0.86412606921235,0.7002073677992604,6967.448496059178,8063,0.8857063678383229,6386.828618482146,7211,0.6814787295505054,580.6198775770306,852

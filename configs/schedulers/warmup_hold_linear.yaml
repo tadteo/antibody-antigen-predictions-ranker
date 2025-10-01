@@ -1,6 +1,6 @@
 training:
   lr_scheduler_type: WarmupHoldLinear
-  warmup_pct: 0.1
+  warmup_pct: 0.15
   hold_pct: 0.4
   min_lr_factor: 0.01
 

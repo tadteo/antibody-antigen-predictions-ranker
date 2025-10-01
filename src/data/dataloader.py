@@ -16,10 +16,6 @@ from src.data.triangular_positional_encoding import triangular_encode_features
 # ==============================================================================
 # Helper functions for distributed training
 # ==============================================================================
-def calculate_local_batch_size(global_batch_size: int, world_size: int = 1) -> int:
-    """Calculate local batch size per rank for distributed training"""
-    return math.ceil(global_batch_size / world_size)
-
 def create_distributed_collate_fn(local_batch_size: int, samples_per_complex: int):
     """Create collate function with correct local batch size for distributed training"""
     return partial(pad_collate_fn, batch_size=local_batch_size, samples_per_complex=samples_per_complex)
@@ -543,8 +539,9 @@ def get_eval_dataloader(manifest_csv: str,
     else:
         dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances)
     
+    local_batch_size = math.ceil(batch_size / world_size)
+
     # Calculate local batch size for distributed training
-    local_batch_size = calculate_local_batch_size(batch_size, world_size) if distributed else batch_size
     collate = create_distributed_collate_fn(local_batch_size, samples_per_complex)
 
     # base_sampler = WeightedComplexSampler(
@@ -620,7 +617,8 @@ def get_dataloader(manifest_csv: str,
         dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances)
 
     # Calculate local batch size for distributed training
-    local_batch_size = calculate_local_batch_size(batch_size, world_size) if distributed else batch_size
+    local_batch_size = math.ceil(batch_size / world_size)
+
     collate = create_distributed_collate_fn(local_batch_size, samples_per_complex)
 
     # Case 1: both constraints

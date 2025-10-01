@@ -3,7 +3,7 @@
 correlation_analysis.py
 
 Compare your DeepSet model's DockQ predictions and the original
-ranking_confidence against ground truth DockQ (label) and TM score.
+ranking_score against ground truth DockQ (label) and TM score.
 
 Generates four scatter plots and prints a summary of Pearson r and MSE.
 """
@@ -98,7 +98,7 @@ def make_scatter_by_complex(x, y, complex_ids, xlabel, ylabel, title, outpath):
 def main():
     p = argparse.ArgumentParser(description="Correlation analysis: model vs ranking")
     p.add_argument("--model_path",      required=True, help=".pt file of your trained model")
-    p.add_argument("--manifest",        default="/proj/berzelius-2021-29/users/x_matta/antibody-antigen-predictions-ranker/data/manifest_with_ptm_no_normalization.csv", help="CSV manifest with ranking_confidence, tm_normalized, label, split")
+    p.add_argument("--manifest",        default="/proj/berzelius-2021-29/users/x_matta/antibody-antigen-predictions-ranker/data/manifest_with_ptm_no_normalization.csv", help="CSV manifest with ranking_score, tm_normalized, label, split")
     p.add_argument("--split",           default="test",  help="Which split to use (train/test)")
     p.add_argument("--batch_size",      type=int, default=4)
     p.add_argument("--num_workers",     type=int, default=2)
@@ -121,10 +121,10 @@ def main():
     )
     preds, labels = evaluate_model(model, dataloader, device)
 
-    # 3) Load manifest to get ranking_confidence & tm_normalized
+    # 3) Load manifest to get ranking_score & tm_normalized
     df = pd.read_csv(args.manifest)
     df = df[df["split"] == args.split].reset_index(drop=True)
-    ranking     = df["ranking_confidence"].values
+    ranking     = df["ranking_score"].values
     tm_score    = df["tm_normalized"].values
     dockq       = df["label"].values   # should match `labels`
     complex_ids = df["complex_id"].tolist()
