@@ -28,13 +28,30 @@ def load_model_and_config(model_path: str, device: torch.device) -> DeepSet:
     cfg_path = os.path.join(model_dir, "config.yaml")
     with open(cfg_path, "r") as f:
         cfg = yaml.safe_load(f)["model"]
+    
+    checkpoint = torch.load(model_path, map_location=device)
+    # Handle both old format (direct state_dict) and new format (with metadata)
+    if "model_state_dict" in checkpoint:
+        sd = checkpoint["model_state_dict"]
+    else:
+        sd = checkpoint
+    
+    # Infer the actual input_dim from the checkpoint weights
+    # phi.0.weight has shape [hidden_dim, input_dim]
+    if "phi.0.weight" in sd:
+        actual_input_dim = sd["phi.0.weight"].shape[1]
+        if actual_input_dim != cfg["input_dim"]:
+            print(f"Warning: Config says input_dim={cfg['input_dim']}, "
+                  f"but checkpoint has input_dim={actual_input_dim}. "
+                  f"Using {actual_input_dim} from checkpoint.")
+            cfg["input_dim"] = actual_input_dim
+    
     model = DeepSet(
         input_dim=cfg["input_dim"],
         phi_hidden_dims=cfg["phi_hidden_dims"],
         rho_hidden_dims=cfg["rho_hidden_dims"],
         aggregator=cfg["aggregator"]
     )
-    sd = torch.load(model_path, map_location=device)
     model.load_state_dict(sd)
     model.to(device)
     model.eval()
@@ -45,13 +62,14 @@ def evaluate_model(model: DeepSet, dataloader, device: torch.device):
     all_preds, all_labels = [], []
     with torch.no_grad():
         for batch in dataloader:
-            feats   = batch["features"].to(device)
-            lengths = batch["lengths"].to(device)
-            labels  = batch["label"].to(device)
-            logits  = model(feats, lengths)
-            preds   = torch.sigmoid(logits)  # in [0,1]
-            all_preds.append(preds.cpu().numpy())
-            all_labels.append(labels.cpu().numpy())
+            feats   = batch["features"].to(device)   # [B, K, N, F]
+            lengths = batch["lengths"].to(device)    # [B, K]
+            labels  = batch["label"].to(device)      # [B, K]
+            logits  = model(feats, lengths)          # [B, K]
+            preds   = torch.sigmoid(logits)          # [B, K] in [0,1]
+            # Flatten to get all predictions
+            all_preds.append(preds.cpu().numpy().flatten())
+            all_labels.append(labels.cpu().numpy().flatten())
     return np.concatenate(all_preds), np.concatenate(all_labels)
 
 def make_scatter(x, y, xlabel, ylabel, title, outpath):
@@ -98,11 +116,12 @@ def make_scatter_by_complex(x, y, complex_ids, xlabel, ylabel, title, outpath):
 def main():
     p = argparse.ArgumentParser(description="Correlation analysis: model vs ranking")
     p.add_argument("--model_path",      required=True, help=".pt file of your trained model")
-    p.add_argument("--manifest",        default="/proj/berzelius-2021-29/users/x_matta/antibody-antigen-predictions-ranker/data/manifest_with_ptm_no_normalization.csv", help="CSV manifest with ranking_score, tm_normalized, label, split")
-    p.add_argument("--split",           default="test",  help="Which split to use (train/test)")
-    p.add_argument("--batch_size",      type=int, default=4)
-    p.add_argument("--num_workers",     type=int, default=2)
-    p.add_argument("--output_dir",      default="correlation_reports")
+    p.add_argument("--manifest",        default="/proj/berzelius-2021-29/users/x_matta/antibody-antigen-predictions-ranker/data/manifest_new_with_distance_filtered_pae_centered_density_with_clipping_500k_maxlen.csv", help="CSV manifest with ranking_score, tm_normalized, label, split")
+    p.add_argument("--split",           default="val",  help="Which split to use (train/test)")
+    p.add_argument("--batch_size",      type=int, default=1, help="Batch size (use 1 to avoid partial batch issues)")
+    p.add_argument("--num_workers",     type=int, default=0, help="Number of workers (0 for main process only)")
+    p.add_argument("--samples_per_complex", type=int, default=5, help="Number of samples per complex (matches training)")
+    p.add_argument("--output_dir",      default="correlation_reports_new_2")
     args = p.parse_args()
     
     os.makedirs(args.output_dir, exist_ok=True)
@@ -111,26 +130,50 @@ def main():
     # 1) Load model
     model = load_model_and_config(args.model_path, device)
 
-    # 2) Prepare dataloader & run model
+    # 2) Prepare dataloader & run model - use the same function as training!
+    model_dir = os.path.dirname(args.model_path)
+    cfg_path = os.path.join(model_dir, "config.yaml")
+    with open(cfg_path, "r") as f:
+        cfg = yaml.safe_load(f)
+    
+    data_cfg = cfg.get("data", {})
+    
     dataloader = get_eval_dataloader(
         args.manifest,
         split=args.split,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        feature_transform=True
+        samples_per_complex=args.samples_per_complex,
+        feature_transform=data_cfg.get("feature_transform", True),
+        feature_centering=data_cfg.get("feature_centering", False),
+        use_interchain_ca_distances=data_cfg.get("use_interchain_ca_distances", False),
+        use_interchain_pae=data_cfg.get("use_interchain_pae", True)
     )
+    
     preds, labels = evaluate_model(model, dataloader, device)
 
-    # 3) Load manifest to get ranking_score & tm_normalized
+    # 3) Note: dataloader samples K per complex, so we'll have fewer samples than manifest
+    n_preds = len(preds)
+    print(f"Got {n_preds} predictions from model")
+    
+    # Load manifest to match predictions with ground truth
     df = pd.read_csv(args.manifest)
     df = df[df["split"] == args.split].reset_index(drop=True)
-    ranking     = df["ranking_score"].values
+    print(f"Manifest has {len(df)} total samples for split={args.split}")
+    
+    # Since we used samples_per_complex, we only evaluated a subset
+    # Match by taking first n_preds rows (dataloader processes sequentially)
+    df = df.head(n_preds)
+    
+    # Handle different column names in different manifest versions
+    ranking_col = "ranking_confidence" if "ranking_confidence" in df.columns else "ranking_score"
+    ranking     = df[ranking_col].values
     tm_score    = df["tm_normalized"].values
-    dockq       = df["label"].values   # should match `labels`
+    dockq       = df["label"].values
     complex_ids = df["complex_id"].tolist()
-
+    
     assert len(preds) == len(ranking) == len(tm_score) == len(dockq) == len(complex_ids), \
-        "Lengths mismatch between model output and manifest!"
+        f"Lengths mismatch: preds={len(preds)}, manifest subset={len(ranking)}"
 
     # 4) Make four standard scatter plots
     make_scatter(preds, dockq,

@@ -380,7 +380,10 @@ class AntibodyAntigenPAEDataset(Dataset):
                  feature_transform=None,
                  feature_centering=False,
                  use_interchain_pae: bool = True,
-                 use_interchain_ca_distances: bool = False):
+                 use_interchain_ca_distances: bool = False,
+                 use_esm_embeddings: bool = False,
+                 use_distance_cutoff: bool = False,
+                 distance_cutoff: float = 12.0):
         self.df = pd.read_csv(manifest_csv)
         # Filter to only this split
         self.df = self.df[self.df["split"] == split].reset_index(drop=True)
@@ -388,6 +391,9 @@ class AntibodyAntigenPAEDataset(Dataset):
         self.feature_centering = feature_centering
         self.use_interchain_pae = use_interchain_pae
         self.use_interchain_ca_distances = use_interchain_ca_distances
+        self.use_esm_embeddings = use_esm_embeddings
+        self.use_distance_cutoff = use_distance_cutoff
+        self.distance_cutoff = distance_cutoff
 
     def __len__(self):
         return len(self.df)
@@ -441,7 +447,51 @@ class AntibodyAntigenPAEDataset(Dataset):
             interchain_indexes_i = old_to_new_idx[interchain_indexes_i]
             interchain_indexes_j = old_to_new_idx[interchain_indexes_j]
 
+            # Store distance mask before distance cutoff is applied
+            distance_mask = None
+            
+            # Optional: Apply distance cutoff to filter out far-away residue pairs
+            if self.use_distance_cutoff and interchain_ca_distances_raw is not None:
+                # Count pairs before filtering
+                n_pairs_before = len(interchain_ca_distances_raw)
+                
+                # Keep only pairs where CA distance is below the cutoff
+                distance_mask = interchain_ca_distances_raw <= self.distance_cutoff
+                n_pairs_after = distance_mask.sum()
+                n_filtered = n_pairs_before - n_pairs_after
+                pct_filtered = (n_filtered / n_pairs_before * 100) if n_pairs_before > 0 else 0.0
+                
+                # Debug output (first 10 samples only to avoid spam)
+                # print(f"[Distance Cutoff Debug] Sample {complex_id}/{sample_id}:")
+                # print(f"  Cutoff: {self.distance_cutoff} Å")
+                # print(f"  Pairs before: {n_pairs_before}")
+                # print(f"  Pairs after:  {n_pairs_after}")
+                # print(f"  Filtered out: {n_filtered} ({pct_filtered:.1f}%)")
+                # if n_pairs_after > 0:
+                #     print(f"  Distance range (kept): [{interchain_ca_distances_raw[distance_mask].min():.2f}, {interchain_ca_distances_raw[distance_mask].max():.2f}] Å")
+                
+                # Apply mask to all arrays
+                interchain_indexes_i = interchain_indexes_i[distance_mask]
+                interchain_indexes_j = interchain_indexes_j[distance_mask]
+                if interchain_pae_vals_raw is not None:
+                    interchain_pae_vals_raw = interchain_pae_vals_raw[distance_mask]
+                interchain_ca_distances_raw = interchain_ca_distances_raw[distance_mask]
 
+            # Optional: ESM embeddings
+            # print(f"use_esm_embeddings: {self.use_esm_embeddings}")
+            # print(f"esm_embeddings in original_sample_group: {'esm_embeddings' in original_sample_group}")
+            if self.use_esm_embeddings and 'esm_embeddings' in original_sample_group:
+                esm_embeddings_raw = original_sample_group['esm_embeddings'][()]  # [L, d_esm]
+                # print(f"esm_embeddings_raw shape: {esm_embeddings_raw.shape}")
+                # Filter to remove X residues
+                esm_embeddings = esm_embeddings_raw[non_x_mask]  # [L', d_esm]
+                # print(f"esm_embeddings shape: {esm_embeddings.shape}")
+                # Extract embeddings for interchain pairs (after distance filtering)
+                esm_i = esm_embeddings[interchain_indexes_i]  # [n, d_esm]
+                esm_j = esm_embeddings[interchain_indexes_j]  # [n, d_esm]
+            else:
+                esm_i = None
+                esm_j = None
 
             label = row["label"] # Scalar label for the single sample case
             if interchain_pae_vals_raw is not None:
@@ -463,6 +513,9 @@ class AntibodyAntigenPAEDataset(Dataset):
                 else:
                     pae_col_mean = hf[complex_id]["pae_col_mean"][()]
                     pae_col_mean = pae_col_mean[valid_pair_mask]
+                    # Apply distance mask if used
+                    if distance_mask is not None:
+                        pae_col_mean = pae_col_mean[distance_mask]
 
                     # pae_col_std = hf[complex_id]["pae_col_std"][()] # Not currently used for centering
                     interchain_pae_vals_centered = interchain_pae_vals_raw - pae_col_mean
@@ -488,6 +541,16 @@ class AntibodyAntigenPAEDataset(Dataset):
                     interchain_indexes_j,
                     interchain_ca_distances_raw,
                 ], dtype=np.float32)
+            
+
+            # Add ESM embeddings if enabled
+            if esm_i is not None and esm_j is not None:
+                # Transpose ESM embeddings to match feature format [d_esm, n]
+                esm_i_T = esm_i.T.astype(np.float32)  # [d_esm, n]
+                esm_j_T = esm_j.T.astype(np.float32)  # [d_esm, n]
+                # Concatenate along feature dimension
+                feats = np.vstack([feats, esm_i_T, esm_j_T])  # [F + 2*d_esm, n]
+                # print(f"feats shape after adding ESM embeddings: {feats.shape}")
             
         
         
@@ -525,6 +588,9 @@ def get_eval_dataloader(manifest_csv: str,
                         feature_centering: bool = False,
                         use_interchain_ca_distances: bool = False,
                         use_interchain_pae: bool = True,
+                        use_esm_embeddings: bool = False,
+                        use_distance_cutoff: bool = False,
+                        distance_cutoff: float = 12.0,
                         seed: int = None,
                         distributed: bool = False,
                         world_size: int = 1,
@@ -535,9 +601,9 @@ def get_eval_dataloader(manifest_csv: str,
     """
     if feature_transform:
         print("Val dataloader: Using triangular positional encoding")
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff)
     else:
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff)
     
     local_batch_size = math.ceil(batch_size / world_size)
 
@@ -594,6 +660,9 @@ def get_dataloader(manifest_csv: str,
                    feature_centering: bool = False,
                    use_interchain_ca_distances: bool = False,
                    use_interchain_pae: bool = True,
+                   use_esm_embeddings: bool = False,
+                   use_distance_cutoff: bool = False,
+                   distance_cutoff: float = 12.0,
                    seed: int = None,
                    distributed: bool = False,
                    world_size: int = 1,
@@ -612,9 +681,9 @@ def get_dataloader(manifest_csv: str,
     """
     if feature_transform:
         print("Train dataloader: Using triangular positional encoding")
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff)
     else:
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff)
 
     # Calculate local batch size for distributed training
     local_batch_size = math.ceil(batch_size / world_size)
