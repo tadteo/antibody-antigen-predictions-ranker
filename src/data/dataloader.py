@@ -12,6 +12,113 @@ from functools import partial
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, Sampler
 import torch.nn.functional as F
 from src.data.triangular_positional_encoding import triangular_encode_features
+from threading import Lock
+import gc
+import atexit
+import weakref
+
+# ==============================================================================
+# HDF5 File Handle Cache (per-worker)
+# ==============================================================================
+class H5FileCache:
+    """
+    Thread-safe cache for HDF5 file handles. Keeps files open for faster access.
+    Each DataLoader worker process will have its own instance.
+    """
+    def __init__(self, chunk_cache_size_mb=512, max_open_files=10):
+        self.cache = {}
+        self.lock = Lock()
+        self.chunk_cache_size = chunk_cache_size_mb * 1024 * 1024  # Convert to bytes
+        self.max_open_files = max_open_files
+        self.access_count = {}  # Track access frequency for LRU eviction
+        self._closed = False
+        
+        # Register cleanup on exit
+        atexit.register(self.close_all)
+        
+    def get_file(self, h5_path):
+        """Get an open HDF5 file handle, opening if necessary"""
+        if self._closed:
+            raise RuntimeError("Attempting to use closed H5FileCache")
+            
+        with self.lock:
+            if h5_path not in self.cache:
+                # If cache is full, remove least recently used file
+                if len(self.cache) >= self.max_open_files:
+                    lru_path = min(self.access_count, key=self.access_count.get)
+                    try:
+                        self.cache[lru_path].close()
+                    except Exception as e:
+                        print(f"Warning: Error closing HDF5 file {lru_path}: {e}")
+                    del self.cache[lru_path]
+                    del self.access_count[lru_path]
+                
+                # Open file with optimized settings
+                try:
+                    self.cache[h5_path] = h5py.File(
+                        h5_path, 'r',
+                        rdcc_nbytes=self.chunk_cache_size,  # Chunk cache size
+                        rdcc_nslots=10007,  # Prime number for hash table
+                        rdcc_w0=0.75  # Preemption policy (0.75 = balanced)
+                    )
+                    self.access_count[h5_path] = 0
+                except Exception as e:
+                    print(f"Error opening HDF5 file {h5_path}: {e}")
+                    raise
+            
+            self.access_count[h5_path] += 1
+            return self.cache[h5_path]
+    
+    def close_all(self):
+        """Close all cached file handles"""
+        if self._closed:
+            return
+            
+        with self.lock:
+            for path, f in list(self.cache.items()):
+                try:
+                    if f is not None and hasattr(f, 'close'):
+                        f.close()
+                except Exception as e:
+                    print(f"Warning: Error closing HDF5 file {path}: {e}")
+            self.cache.clear()
+            self.access_count.clear()
+            self._closed = True
+    
+    def __del__(self):
+        try:
+            self.close_all()
+        except:
+            pass
+
+# Global cache - will be separate per worker process due to fork/spawn
+_worker_file_cache = None
+
+def get_worker_file_cache(chunk_cache_size_mb=512, max_open_files=20):
+    """Get or create the file cache for this worker"""
+    global _worker_file_cache
+    if _worker_file_cache is None:
+        _worker_file_cache = H5FileCache(chunk_cache_size_mb, max_open_files)
+    return _worker_file_cache
+
+def cleanup_worker():
+    """Cleanup function to be called when DataLoader worker shuts down"""
+    global _worker_file_cache
+    if _worker_file_cache is not None:
+        try:
+            _worker_file_cache.close_all()
+        except Exception as e:
+            print(f"Warning: Error during worker cleanup: {e}")
+        finally:
+            _worker_file_cache = None
+    
+    # Force garbage collection to clean up any remaining references
+    gc.collect()
+
+def worker_init_fn(worker_id):
+    """Initialize worker and register cleanup on exit"""
+    # Register cleanup function to be called when worker exits
+    atexit.register(cleanup_worker)
 
 # ==============================================================================
 # Helper functions for distributed training
@@ -383,7 +490,10 @@ class AntibodyAntigenPAEDataset(Dataset):
                  use_interchain_ca_distances: bool = False,
                  use_esm_embeddings: bool = False,
                  use_distance_cutoff: bool = False,
-                 distance_cutoff: float = 12.0):
+                 distance_cutoff: float = 12.0,
+                 use_file_cache: bool = True,
+                 cache_size_mb: int = 512,
+                 max_cached_files: int = 20):
         self.df = pd.read_csv(manifest_csv)
         # Filter to only this split
         self.df = self.df[self.df["split"] == split].reset_index(drop=True)
@@ -394,6 +504,9 @@ class AntibodyAntigenPAEDataset(Dataset):
         self.use_esm_embeddings = use_esm_embeddings
         self.use_distance_cutoff = use_distance_cutoff
         self.distance_cutoff = distance_cutoff
+        self.use_file_cache = use_file_cache
+        self.cache_size_mb = cache_size_mb
+        self.max_cached_files = max_cached_files
 
     def __len__(self):
         return len(self.df)
@@ -405,7 +518,20 @@ class AntibodyAntigenPAEDataset(Dataset):
         sample_id  = row["sample"]   # Original sample_id for this item
         
         # Load raw PAE data and create a 3xn with the interchain indexes and the interchain pae values
-        with h5py.File(h5_path, 'r') as hf:
+        # Use cached file handle if enabled, otherwise use context manager for proper cleanup
+        if self.use_file_cache:
+            file_cache = get_worker_file_cache(self.cache_size_mb, self.max_cached_files)
+            hf = file_cache.get_file(h5_path)
+            # Use cached file - don't close it
+            return self._load_sample_data(hf, row, complex_id, sample_id)
+        else:
+            # Use context manager for automatic cleanup
+            with h5py.File(h5_path, 'r') as hf:
+                return self._load_sample_data(hf, row, complex_id, sample_id)
+    
+    def _load_sample_data(self, hf, row, complex_id, sample_id):
+        """Helper method to load sample data from an open HDF5 file handle"""
+        try:
             # Data for the primary sample
             original_sample_group = hf[complex_id][sample_id]
             interchain_pae_vals_raw = original_sample_group["interchain_pae_vals"][()]
@@ -469,6 +595,15 @@ class AntibodyAntigenPAEDataset(Dataset):
                 # print(f"  Filtered out: {n_filtered} ({pct_filtered:.1f}%)")
                 # if n_pairs_after > 0:
                 #     print(f"  Distance range (kept): [{interchain_ca_distances_raw[distance_mask].min():.2f}, {interchain_ca_distances_raw[distance_mask].max():.2f}] Å")
+                
+                # IMPORTANT: If all pairs are filtered out, keep the closest pair to avoid empty samples
+                if n_pairs_after == 0:
+                    # Find the closest pair and keep it
+                    closest_idx = np.argmin(interchain_ca_distances_raw)
+                    distance_mask = np.zeros(len(interchain_ca_distances_raw), dtype=bool)
+                    distance_mask[closest_idx] = True
+                    # print(f"WARNING: Sample {complex_id}/{sample_id} - all pairs beyond cutoff {self.distance_cutoff}Å. "
+                    #       f"Keeping closest pair at {interchain_ca_distances_raw[closest_idx]:.2f}Å to avoid empty sample.")
                 
                 # Apply mask to all arrays
                 interchain_indexes_i = interchain_indexes_i[distance_mask]
@@ -551,29 +686,30 @@ class AntibodyAntigenPAEDataset(Dataset):
                 # Concatenate along feature dimension
                 feats = np.vstack([feats, esm_i_T, esm_j_T])  # [F + 2*d_esm, n]
                 # print(f"feats shape after adding ESM embeddings: {feats.shape}")
+        
+            # Optional user‐provided transform (applies to feats)
+            if self.feature_transform:
+                feats = self.feature_transform(feats)
             
-        
-        
-        # Optional user‐provided transform (applies to feats)
-        if self.feature_transform:
-            feats = self.feature_transform(feats)
-        
-        # print(f"feats shape: {feats.shape}")
+            # print(f"feats shape: {feats.shape}")
 
-        # Transform label(s) using clipped logit - works element-wise if label is an array
-        # print(f"label before: {label}")
-        epsilon = 1e-6
-        label = np.clip(label, epsilon, 1 - epsilon)
-        label = np.log(label / (1 - label))
+            # Transform label(s) using clipped logit - works element-wise if label is an array
+            # print(f"label before: {label}")
+            epsilon = 1e-6
+            label = np.clip(label, epsilon, 1 - epsilon)
+            label = np.log(label / (1 - label))
 
-        return {
-            "features": torch.from_numpy(feats),            # [3..5, n]
-            "label":    torch.tensor(label, dtype=torch.float32), # DockQ (logit transformed)
-            "weight":   torch.tensor(row["weight"]),         # importance weight
-            "length":   torch.tensor(len(feats[0])),         # length of the sample
-            "complex_id": complex_id,
-            "ranking_score": torch.tensor(ranking_score)
-        }
+            return {
+                "features": torch.from_numpy(feats),            # [3..5, n]
+                "label":    torch.tensor(label, dtype=torch.float32), # DockQ (logit transformed)
+                "weight":   torch.tensor(row["weight"]),         # importance weight
+                "length":   torch.tensor(len(feats[0])),         # length of the sample
+                "complex_id": complex_id,
+                "ranking_score": torch.tensor(ranking_score)
+            }
+        except Exception as e:
+            print(f"Error loading sample {complex_id}/{sample_id}: {e}")
+            raise
 
 
 # ==============================================================================
@@ -591,6 +727,9 @@ def get_eval_dataloader(manifest_csv: str,
                         use_esm_embeddings: bool = False,
                         use_distance_cutoff: bool = False,
                         distance_cutoff: float = 12.0,
+                        use_file_cache: bool = True,
+                        cache_size_mb: int = 512,
+                        max_cached_files: int = 20,
                         seed: int = None,
                         distributed: bool = False,
                         world_size: int = 1,
@@ -601,9 +740,9 @@ def get_eval_dataloader(manifest_csv: str,
     """
     if feature_transform:
         print("Val dataloader: Using triangular positional encoding")
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff, use_file_cache=use_file_cache, cache_size_mb=cache_size_mb, max_cached_files=max_cached_files)
     else:
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff, use_file_cache=use_file_cache, cache_size_mb=cache_size_mb, max_cached_files=max_cached_files)
     
     local_batch_size = math.ceil(batch_size / world_size)
 
@@ -644,6 +783,7 @@ def get_eval_dataloader(manifest_csv: str,
                       batch_sampler=sampler,
                       num_workers=num_workers,
                       pin_memory=True,
+                      persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
                       collate_fn=collate)
 
 
@@ -663,6 +803,9 @@ def get_dataloader(manifest_csv: str,
                    use_esm_embeddings: bool = False,
                    use_distance_cutoff: bool = False,
                    distance_cutoff: float = 12.0,
+                   use_file_cache: bool = True,
+                   cache_size_mb: int = 512,
+                   max_cached_files: int = 20,
                    seed: int = None,
                    distributed: bool = False,
                    world_size: int = 1,
@@ -681,9 +824,9 @@ def get_dataloader(manifest_csv: str,
     """
     if feature_transform:
         print("Train dataloader: Using triangular positional encoding")
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff, use_file_cache=use_file_cache, cache_size_mb=cache_size_mb, max_cached_files=max_cached_files)
     else:
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff, use_file_cache=use_file_cache, cache_size_mb=cache_size_mb, max_cached_files=max_cached_files)
 
     # Calculate local batch size for distributed training
     local_batch_size = math.ceil(batch_size / world_size)
@@ -720,6 +863,7 @@ def get_dataloader(manifest_csv: str,
                           batch_sampler=sampler,
                           num_workers=num_workers,
                           pin_memory=True,
+                          persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
                           collate_fn=collate)
 
     # Case 2: uniform per complex
@@ -752,6 +896,7 @@ def get_dataloader(manifest_csv: str,
                           batch_sampler=sampler,
                           num_workers=num_workers,
                           pin_memory=True,
+                          persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
                           collate_fn=collate)
 
     if samples_per_complex is None:
@@ -783,6 +928,7 @@ def get_dataloader(manifest_csv: str,
                           batch_sampler=sampler,
                           num_workers=num_workers,
                           pin_memory=True,
+                          persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
                           collate_fn=collate)
 
 

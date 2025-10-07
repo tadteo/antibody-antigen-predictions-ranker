@@ -3,12 +3,12 @@ data:
   processed_dir: data/processed
   processed_file: processed_data.h5
   splits_dir: data/raw_splits
-  manifest_file: data/manifest_new_with_filtered_test_density_with_clipping_500k_maxlen.csv
+  manifest_file: data/manifest_new_with_filtered_test_density_with_clipping_500k_maxlen_esm.csv
   feature_transform: true
   feature_centering: true
-  batch_size_per_gpu: 2 #8 max batch for sum aggregators #6 max batch for concat_stats aggregator #4 max batch for attn_pool aggregator
-  num_workers: 8
-  samples_per_complex: 5
+  batch_size_per_gpu: 16 #8 max batch for sum aggregators #6 max batch for concat_stats aggregator #4 max batch for attn_pool aggregator
+  num_workers: 20
+  samples_per_complex: 10
   use_interchain_ca_distances: true
   use_interchain_pae: true
   use_esm_embeddings: true
@@ -17,8 +17,8 @@ data:
   distance_cutoff: 12.0  # Maximum CA distance in Angstroms (only used if use_distance_cutoff is true)
   # HDF5 file caching optimization
   use_file_cache: true  # Keep HDF5 files open for faster access
-  cache_size_mb: 2048  # HDF5 chunk cache size in MB per file
-  max_cached_files: 100  # Maximum number of HDF5 files to keep open simultaneously per worker
+  cache_size_mb: 4048  # HDF5 chunk cache size in MB per file
+  max_cached_files: 300  # Maximum number of HDF5 files to keep open simultaneously per worker
 
 model:
   input_dim: 4
@@ -28,9 +28,9 @@ model:
 
 training:
   adaptive_weight: true
-  epochs: 150
+  epochs: 250
   lr: !!float 5e-3
-  weight_decay: 0.0
+  weight_decay: !!float 1e-5
   smooth_l1_beta: 0.5
   weighted_loss: true
   bucket_balance: false

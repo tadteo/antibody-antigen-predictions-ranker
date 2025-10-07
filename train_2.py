@@ -375,6 +375,9 @@ def main():
     esm_embedding_dim = cfg.data.get('esm_embedding_dim', 0)
     use_distance_cutoff = cfg.data.get('use_distance_cutoff', False)
     distance_cutoff = cfg.data.get('distance_cutoff', 10.0)
+    use_file_cache = cfg.data.get('use_file_cache', True)
+    cache_size_mb = cfg.data.get('cache_size_mb', 512)
+    max_cached_files = cfg.data.get('max_cached_files', 20)
     print(f"Use interchain PAE: {use_interchain_pae}")
     print(f"Use ESM embeddings: {use_esm_embeddings} (dim={esm_embedding_dim})")
 
@@ -393,6 +396,10 @@ def main():
         print(f"Use distance cutoff: {use_distance_cutoff}")
         if use_distance_cutoff:
             print(f"Distance cutoff: {distance_cutoff} Å")
+        print(f"Use HDF5 file cache: {use_file_cache}")
+        if use_file_cache:
+            print(f"  Cache size: {cache_size_mb} MB per file")
+            print(f"  Max cached files: {max_cached_files} per worker")
 
     # 3) DataLoaders
     #    - train: with our chosen sampler
@@ -414,6 +421,9 @@ def main():
         use_esm_embeddings=use_esm_embeddings,
         use_distance_cutoff=use_distance_cutoff,
         distance_cutoff=distance_cutoff,
+        use_file_cache=use_file_cache,
+        cache_size_mb=cache_size_mb,
+        max_cached_files=max_cached_files,
         seed=seed,
         distributed=is_distributed,
         world_size=world_size,
@@ -433,6 +443,9 @@ def main():
         use_esm_embeddings=use_esm_embeddings,
         use_distance_cutoff=use_distance_cutoff,
         distance_cutoff=distance_cutoff,
+        use_file_cache=use_file_cache,
+        cache_size_mb=cache_size_mb,
+        max_cached_files=max_cached_files,
         seed=seed,
         distributed=is_distributed,
         world_size=world_size,
@@ -668,7 +681,6 @@ def main():
     # Initialize persistent wandb tables for accumulating plots across epochs (only on rank 0)
     if fabric.global_rank == 0:
         all_complexes_table = wandb.Table(columns=["epoch", "image"], log_mode= 'INCREMENTAL')
-        delta_rho_table = wandb.Table(columns=["epoch", "image"], log_mode= 'INCREMENTAL')
         per_complex_table = wandb.Table(columns=["epoch", "complex_id", "image"], log_mode= 'INCREMENTAL')
 
 
@@ -819,85 +831,85 @@ def main():
             print(f"  - Sample val_labels range: {val_labels.min():.3f} to {val_labels.max():.3f}")
             
             # =============== TABLE 1: Per-complex prediction vs target ===============
-            
-            # Create scatter plots for 10 random complexes
-            random_cids = random.sample(cid, 10)
-            print(f"Random complexes: {random_cids}")
-            
-            for complex_id in random_cids:
-                if complex_id in per_complex_points:
-                    complex_preds = np.array(per_complex_points[complex_id]['model'])
-                    complex_targets = np.array(per_complex_points[complex_id]['true'])
-                    
-                    if len(complex_preds) > 0 and len(complex_targets) > 0:
-                        # Create scatter plot for this complex
-                        fig, ax = plt.subplots(figsize=(8, 6))
-                        ax.scatter(complex_targets, complex_preds, alpha=0.6)
-                        ax.plot([0, 1], [0, 1], 'r--', alpha=0.8)  # diagonal line
-                        ax.set_xlabel('True DockQ')
-                        ax.set_ylabel('Predicted DockQ')
-                        ax.set_title(f'Complex {complex_id}: Prediction vs Target (Epoch {epoch})')
-                        ax.grid(True, alpha=0.3)
+            # Only plot every 10 epochs
+            if epoch % 10 == 0 or epoch == 1:
+                # Create scatter plots for 10 random complexes
+                random_cids = random.sample(cid, 10)
+                print(f"Random complexes: {random_cids}")
+                
+                for complex_id in random_cids:
+                    if complex_id in per_complex_points:
+                        complex_preds = np.array(per_complex_points[complex_id]['model'])
+                        complex_targets = np.array(per_complex_points[complex_id]['true'])
                         
-                        # Add single row to table for this complex
-                        per_complex_table.add_data(
-                            epoch, str(complex_id), wandb.Image(fig)
-                        )
-                        plt.close(fig)
+                        if len(complex_preds) > 0 and len(complex_targets) > 0:
+                            # Create scatter plot for this complex
+                            fig, ax = plt.subplots(figsize=(8, 6))
+                            ax.scatter(complex_targets, complex_preds, alpha=0.6)
+                            ax.plot([0, 1], [0, 1], 'r--', alpha=0.8)  # diagonal line
+                            ax.set_xlabel('True DockQ')
+                            ax.set_ylabel('Predicted DockQ')
+                            ax.set_title(f'Complex {complex_id}: Prediction vs Target (Epoch {epoch})')
+                            ax.grid(True, alpha=0.3)
+                            
+                            # Add single row to table for this complex
+                            per_complex_table.add_data(
+                                epoch, str(complex_id), wandb.Image(fig)
+                            )
+                            plt.close(fig)
             
             # =============== TABLE 2: All complexes combined ===============
-        
-            # Create combined scatter plot
-            print(f"Creating all complexes plot with {len(val_preds)} points")
-            fig, ax = plt.subplots(figsize=(10, 8))
-            scatter = ax.scatter(val_labels, val_preds, alpha=0.6, s=20)
-            ax.plot([0, 1], [0, 1], 'r--', alpha=0.8, linewidth=2)  # diagonal line
-            ax.set_xlabel('True DockQ', fontsize=12)
-            ax.set_ylabel('Predicted DockQ', fontsize=12)
-            ax.set_title(f'All Complexes: Prediction vs Target (Epoch {epoch})')
-            ax.grid(True, alpha=0.3)
+            # Only plot every 10 epochs
+            if epoch % 10 == 0 or epoch == 1:
+                # Create combined scatter plot with colors by complex
+                print(f"Creating all complexes plot with {len(val_preds)} points from {len(cid)} complexes")
+                
+                # Prepare colors for each complex
+                import matplotlib.cm as cm
+                
+                # Create arrays for plotting with colors by complex
+                plot_labels = []
+                plot_preds = []
+                plot_colors = []
+                
+                # Generate a color for each complex
+                colormap = cm.get_cmap('tab20')  # Good for categorical data
+                num_complexes = len(cid)
+                
+                for idx, complex_id in enumerate(cid):
+                    if complex_id in per_complex_points:
+                        complex_preds = np.array(per_complex_points[complex_id]['model'])
+                        complex_targets = np.array(per_complex_points[complex_id]['true'])
+                        
+                        if len(complex_preds) > 0 and len(complex_targets) > 0:
+                            plot_labels.extend(complex_targets.tolist())
+                            plot_preds.extend(complex_preds.tolist())
+                            # Assign same color to all points from this complex
+                            color = colormap(idx % 20)  # tab20 has 20 colors, cycle if needed
+                            plot_colors.extend([color] * len(complex_preds))
+                
+                plot_labels = np.array(plot_labels)
+                plot_preds = np.array(plot_preds)
+                
+                fig, ax = plt.subplots(figsize=(12, 9))
+                scatter = ax.scatter(plot_labels, plot_preds, c=plot_colors, alpha=0.6, s=20, edgecolors='none')
+                ax.plot([0, 1], [0, 1], 'r--', alpha=0.8, linewidth=2)  # diagonal line
+                ax.set_xlabel('True DockQ', fontsize=12)
+                ax.set_ylabel('Predicted DockQ', fontsize=12)
+                ax.set_title(f'All Complexes: Prediction vs Target (Epoch {epoch})\n{num_complexes} complexes, {len(plot_preds)} points', fontsize=13)
+                ax.grid(True, alpha=0.3)
+                
+                # Add text annotation with statistics
+                correlation = np.corrcoef(plot_labels, plot_preds)[0, 1]
+                mae = np.mean(np.abs(plot_preds - plot_labels))
+                info_text = f'Complexes: {num_complexes}\nTotal points: {len(plot_preds)}\nCorrelation: {correlation:.3f}\nMAE: {mae:.4f}'
+                ax.text(0.05, 0.95, info_text, transform=ax.transAxes, 
+                        bbox=dict(boxstyle="round,pad=0.5", facecolor="white", alpha=0.9),
+                        verticalalignment='top', fontsize=10)
+                
+                all_complexes_table.add_data(epoch, wandb.Image(fig))
+                plt.close(fig)
             
-            # Add correlation info
-            # correlation = np.corrcoef(val_labels, val_preds)[0, 1]
-            # ax.text(0.05, 0.95, f'Correlation: {correlation:.3f}', transform=ax.transAxes, 
-            #         bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
-            
-            all_complexes_table.add_data(epoch, wandb.Image(fig))
-            plt.close(fig)
-            
-            # =============== TABLE 3: Delta rho vs baseline rho ===============
-            # Create delta rho scatter plot for all complexes
-            fig, ax = plt.subplots(figsize=(10, 8))
-            
-            valid_rho_b = []
-            valid_delta = []
-            valid_complex_ids = []
-            
-            for i in range(n):
-                r_b = float(rho_b[i])
-                d = float(delta[i])
-                if np.isfinite(r_b) and np.isfinite(d):
-                    valid_rho_b.append(r_b)
-                    valid_delta.append(d)
-                    valid_complex_ids.append(str(cid[i]) if i < len(cid) else f"complex_{i}")
-            
-            print(f"Plotting {len(valid_rho_b)} valid points")
-            scatter = ax.scatter(valid_rho_b, valid_delta, alpha=0.7, s=50, c='blue', edgecolors='black', linewidth=0.5)
-            ax.axhline(y=0, color='red', linestyle='--', alpha=0.8, linewidth=2)  # zero line
-            ax.set_xlabel('Baseline True Rho', fontsize=12)
-            ax.set_ylabel('Delta Rho (Model - Baseline)', fontsize=12)
-            ax.set_title(f'Delta Rho vs Baseline Rho (Epoch {epoch})')
-            ax.grid(True, alpha=0.3)
-            
-            # Add text annotation with statistics
-            # mean_delta = np.mean(valid_delta)
-            # ax.text(0.05, 0.95, f'Mean Δρ: {mean_delta:.3f}\nPoints: {len(valid_rho_b)}', 
-            #         transform=ax.transAxes, 
-            #         bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
-            #         verticalalignment='top')
-            
-            delta_rho_table.add_data(epoch, wandb.Image(fig))
-            plt.close(fig)
 
             
             
@@ -978,8 +990,7 @@ def main():
             wandb.log(combined_log_dict, step=epoch)
             wandb.log({
                 "val/per_complex_pred_vs_target": per_complex_table,
-                "val/all_complexes_pred_vs_target": all_complexes_table,
-                "val/delta_rho_vs_baseline": delta_rho_table,})
+                "val/all_complexes_pred_vs_target": all_complexes_table,})
         # broadcast scalar val_loss to every rank (sum of {x,0,0,...} -> x on all)
         val_loss_t = torch.tensor(val_loss_scalar, device=fabric.device, dtype=torch.float32)
         val_loss_t = fabric.all_reduce(val_loss_t, reduce_op="sum")

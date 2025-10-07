@@ -1,3 +1,6 @@
+# High-Performance Configuration Example
+# Use this if you have 64+ GB RAM and want maximum I/O speed
+
 data:
   raw_dir: data/raw
   processed_dir: data/processed
@@ -6,19 +9,26 @@ data:
   manifest_file: data/manifest_new_with_filtered_test_density_with_clipping_500k_maxlen_esm.csv
   feature_transform: true
   feature_centering: true
-  batch_size_per_gpu: 16 #8 max batch for sum aggregators #6 max batch for concat_stats aggregator #4 max batch for attn_pool aggregator
-  num_workers: 8
-  samples_per_complex: 8
+  batch_size_per_gpu: 4
+  
+  # ====== HIGH-PERFORMANCE I/O SETTINGS ======
+  num_workers: 16              # Increase workers (2x num_GPUs recommended)
+  
+  # HDF5 file caching - AGGRESSIVE settings for maximum speed
+  use_file_cache: true         # Enable file handle caching
+  cache_size_mb: 2048          # 2 GB chunk cache per file (large!)
+  max_cached_files: 100        # Keep 100 files open per worker (high!)
+  # Expected memory: ~16 workers × 100 files × 2 GB = ~3.2 TB max (rarely reached)
+  # Typical usage: ~10-20 GB per worker
+  # ============================================
+  
+  samples_per_complex: 5
   use_interchain_ca_distances: true
   use_interchain_pae: true
   use_esm_embeddings: true
   esm_embedding_dim: 320
-  use_distance_cutoff: true  # Enable filtering of residue pairs by distance
-  distance_cutoff: 12.0  # Maximum CA distance in Angstroms (only used if use_distance_cutoff is true)
-  # HDF5 file caching optimization
-  use_file_cache: true  # Keep HDF5 files open for faster access
-  cache_size_mb: 4048  # HDF5 chunk cache size in MB per file
-  max_cached_files: 300  # Maximum number of HDF5 files to keep open simultaneously per worker
+  use_distance_cutoff: true
+  distance_cutoff: 12.0
 
 model:
   input_dim: 4
@@ -36,12 +46,13 @@ training:
   bucket_balance: false
   num_buckets: 4
   seed: 42
-  lr_scheduler_type: "WarmupHoldLinear"  # or "ReduceLROnPlateau" or "WarmupHoldLinear"
-  add_ranking_loss: true      # Whether to add the ranking loss
+  lr_scheduler_type: "WarmupHoldLinear"
+  add_ranking_loss: true
   add_distance_preservation_loss: true
-  ranking_loss_type: "one_minus_rho"  # "fisher" or "one_minus_rho"
+  ranking_loss_type: "one_minus_rho"
   distance_loss_start_epoch: 1
   distance_lambda: 1.0
   distance_lambda_start: 1.0
   distance_lambda_min: 0.2
   distance_lambda_max: 10.0
+

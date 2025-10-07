@@ -1,0 +1,2 @@
+Model,Split,Pearson_DockQ,Spearman_DockQ,MSE_DockQ,Avg_PerComplex_Spearman,Top1_mean_quality,Top1_overlap,Top1_success_rate,Top3_mean_quality,Top3_overlap,Top3_success_rate,mean_rank_of_best,mean_score_high,mean_score_medium,mean_score_acceptable,mean_score_poor,auc_high,auc_medium,auc_acceptable
+Baseline,val,0.5858,0.6097,0.0982,0.1868,0.3799,0.0920,0.5153,0.3784,0.2209,0.5337,11.0000,0.7173,0.6336,0.5206,0.4661,0.7614,0.8529,0.8485

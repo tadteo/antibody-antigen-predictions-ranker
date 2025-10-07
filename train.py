@@ -378,9 +378,15 @@ def main():
     feature_centering   = cfg.data.get('feature_centering', False)
     use_interchain_ca_distances = cfg.data.get('use_interchain_ca_distances', False)
     use_interchain_pae = cfg.data.get('use_interchain_pae', True)
+    use_esm_embeddings = cfg.data.get('use_esm_embeddings', False)
+    esm_embedding_dim = cfg.data.get('esm_embedding_dim', 0)
     use_distance_cutoff = cfg.data.get('use_distance_cutoff', False)
     distance_cutoff = cfg.data.get('distance_cutoff', 10.0)
+    use_file_cache = cfg.data.get('use_file_cache', True)
+    cache_size_mb = cfg.data.get('cache_size_mb', 512)
+    max_cached_files = cfg.data.get('max_cached_files', 20)
     print(f"Use interchain PAE: {use_interchain_pae}")
+    print(f"Use ESM embeddings: {use_esm_embeddings} (dim={esm_embedding_dim})")
 
     # adaptive weight: focus more on extreme targets (DockQ near 0 or 1)
     adaptive_weight = cfg.training.get('adaptive_weight', False)
@@ -396,6 +402,10 @@ def main():
         print(f"Use distance cutoff: {use_distance_cutoff}")
         if use_distance_cutoff:
             print(f"Distance cutoff: {distance_cutoff} Å")
+        print(f"Use HDF5 file cache: {use_file_cache}")
+        if use_file_cache:
+            print(f"  Cache size: {cache_size_mb} MB per file")
+            print(f"  Max cached files: {max_cached_files} per worker")
 
     # 3) DataLoaders
     #    - train: with our chosen sampler
@@ -414,8 +424,12 @@ def main():
         feature_centering=feature_centering,
         use_interchain_ca_distances=use_interchain_ca_distances,
         use_interchain_pae=use_interchain_pae,
+        use_esm_embeddings=use_esm_embeddings,
         use_distance_cutoff=use_distance_cutoff,
         distance_cutoff=distance_cutoff,
+        use_file_cache=use_file_cache,
+        cache_size_mb=cache_size_mb,
+        max_cached_files=max_cached_files,
         seed=seed,
         distributed=is_distributed,
         world_size=world_size,
@@ -432,8 +446,12 @@ def main():
         feature_centering=feature_centering,
         use_interchain_ca_distances=use_interchain_ca_distances,
         use_interchain_pae=use_interchain_pae,
+        use_esm_embeddings=use_esm_embeddings,
         use_distance_cutoff=use_distance_cutoff,
         distance_cutoff=distance_cutoff,
+        use_file_cache=use_file_cache,
+        cache_size_mb=cache_size_mb,
+        max_cached_files=max_cached_files,
         seed=seed,
         distributed=is_distributed,
         world_size=world_size,
@@ -444,10 +462,13 @@ def main():
     # Adjust input_dim if we append interchain Cα distances as an extra feature
     input_dim_base   = int(cfg.model.input_dim)
     input_dim        = input_dim_base + (1 if use_interchain_ca_distances else 0) - (0 if use_interchain_pae else 2)
+    # Add ESM embedding dimensions (2x since we have embeddings for both residues i and j)
+    if use_esm_embeddings:
+        input_dim += 2 * esm_embedding_dim
     phi_hidden_dims  = cfg.model.phi_hidden_dims
     rho_hidden_dims  = cfg.model.rho_hidden_dims
     aggregator       = cfg.model.aggregator
-    print(f"input_dim: {input_dim}")
+    print(f"input_dim: {input_dim} (base={input_dim_base}, ca_dist={use_interchain_ca_distances}, esm={use_esm_embeddings})")
     model = DeepSet(input_dim, phi_hidden_dims, rho_hidden_dims, aggregator=aggregator)
     model.apply(init_weights)
 
