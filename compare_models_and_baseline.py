@@ -56,7 +56,7 @@ def load_model_and_config(model_path: str, device: torch.device):
     if "phi.0.weight" in state_dict:
         actual_input_dim = state_dict["phi.0.weight"].shape[1]
         model_cfg['input_dim'] = actual_input_dim
-    
+
     model = DeepSet(
         input_dim=model_cfg.get('input_dim'),
         phi_hidden_dims=model_cfg.get('phi_hidden_dims'),
@@ -76,7 +76,7 @@ def evaluate_model(model: torch.nn.Module, dataloader, device: torch.device):
     all_preds = []
     all_labels = []
     all_complex_ids = []
-    
+
     with torch.no_grad():
         for batch in tqdm(dataloader):
             feats = batch['features'].to(device)
@@ -93,7 +93,7 @@ def evaluate_model(model: torch.nn.Module, dataloader, device: torch.device):
             
             all_preds.append(preds.cpu().numpy().reshape(-1))
             all_labels.append(labels.cpu().numpy().reshape(-1))
-    
+
     predictions = np.concatenate(all_preds) if all_preds else np.array([])
     true_labels = np.concatenate(all_labels) if all_labels else np.array([])
     
@@ -137,7 +137,7 @@ def mean_squared_error(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 def compute_topk_metrics(predictions: np.ndarray, true_labels: np.ndarray, 
                          complex_ids: list, quality_threshold: float = 0.23,
-                         k_values: list = [1, 3]) -> dict:
+                         k_values: list = [1]) -> dict:
     """
     
     Measure RANKING ACCURACY: How good is the top-K selection according to this ranking?
@@ -306,7 +306,7 @@ def plot_scatter(x_values: np.ndarray, y_values: np.ndarray, complex_ids: list,
     
     if len(x_plot) == 0:
         return
-    
+
     unique_cids = sorted(list(set(complex_ids_plot)))
     cid_to_idx = {cid: i for i, cid in enumerate(unique_cids)}
     colors = [cid_to_idx[c] for c in complex_ids_plot]
@@ -341,7 +341,7 @@ def plot_combined_scatter(all_data: list, xlabel: str, ylabel: str,
         color = model_colors.get(name, 'gray')
         plt.scatter(x_plot, y_plot, alpha=0.5, s=30, label=name,
                    color=color, marker=markers[i % len(markers)])
-    
+
     plt.plot([0,1], [0,1], 'k--', alpha=0.4, label='Ideal (1:1)')
     plt.xlabel(xlabel, fontsize=12)
     plt.ylabel(ylabel, fontsize=12)
@@ -365,7 +365,7 @@ def plot_metric_bars(metrics_data: OrderedDict, title: str, ylabel: str,
     
     if not names:
         return
-    
+
     plt.figure(figsize=(10, 6))
     bars = plt.bar(names, values, color=colors)
     plt.ylabel(ylabel, fontsize=10)
@@ -392,23 +392,20 @@ def main():
     parser.add_argument("--model_list_file", type=str, 
                        default="/proj/berzelius-2021-29/users/x_matta/antibody-antigen-predictions-ranker/configs/models_to_test.txt",
                        help="Text file with model paths, one per line")
-    parser.add_argument("--output_dir", type=str, default="comparison_reports",
+    parser.add_argument("--output_dir", type=str, default="comparison_reports_tmp",
                        help="Output directory for plots and reports")
-    parser.add_argument("--splits", type=str, default="val",
+    parser.add_argument("--splits", type=str, default="val,train,test",
                        help="Comma-separated splits to evaluate (e.g., val,test)")
-    parser.add_argument("--manifest_path", type=str, default=None,
+    parser.add_argument("--manifest_path", type=str, default="/proj/berzelius-2021-29/users/x_matta/antibody-antigen-predictions-ranker/data/manifest_new_with_filtered_test_density_with_clipping_500k_maxlen_esm.csv",
                        help="Path to manifest CSV (if not provided, uses first model's config)")
-    parser.add_argument("--batch_size", type=int, default=32,
-                       help="Batch size for evaluation")
-    parser.add_argument("--num_workers", type=int, default=4,
-                       help="Number of dataloader workers")
-    
+
+
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     splits = [s.strip() for s in args.splits.split(',') if s.strip()]
-    
+
     # Load model paths
     if not os.path.exists(args.model_list_file):
         print(f"Error: Model list file not found: {args.model_list_file}")
@@ -416,15 +413,15 @@ def main():
     
     with open(args.model_list_file, 'r') as f:
         model_paths = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-    
+
     if not model_paths:
         print("No model paths found")
         return
-    
+
     # Generate model IDs and colors
     baseline_id = "Baseline"
     model_ids = {path: f"Model_{i+1}" for i, path in enumerate(model_paths)}
-    all_ids = [baseline_id] + list(model_ids.values())
+    all_ids = ["Random", baseline_id] + list(model_ids.values()) + ["Oracle"]
     
     cmap = matplotlib.colormaps.get_cmap('tab10')
     model_colors = {name: cmap(i % 10) for i, name in enumerate(all_ids)}
@@ -443,26 +440,26 @@ def main():
     if not os.path.exists(manifest_path):
         print(f"Error: Manifest not found: {manifest_path}")
         return
-    
+
     # Load manifest
     try:
         main_df = pd.read_csv(manifest_path)
     except Exception as e:
         print(f"Error reading manifest: {e}")
         return
-    
+
     ranking_col = "ranking_confidence" if "ranking_confidence" in main_df.columns else "ranking_score"
     required_cols = ['complex_id', 'label', ranking_col, 'split']
     if not all(col in main_df.columns for col in required_cols):
         print(f"Error: Missing required columns in manifest")
         return
-    
+
     # Collect data for all models and baseline
     all_results = defaultdict(dict)
-    
+
     for split in splits:
         print(f"\n=== Processing split: {split} ===")
-        
+
         # Baseline data
         split_df = main_df[main_df['split'] == split].reset_index(drop=True)
         if not split_df.empty:
@@ -471,9 +468,24 @@ def main():
                 "true_dockq": split_df['label'].values,
                 "complex_ids": split_df['complex_id'].tolist(),
             }
+            
             #how many samples and how many complexes
             print(f"Baseline: {len(split_df)} samples and {len(split_df['complex_id'].unique())} complexes")
-        
+            # Random baseline: random scores for each structure
+            np.random.seed(42)
+            all_results["Random"][split] = {
+                "predictions": np.random.uniform(0, 1, len(split_df)),
+                "true_dockq": split_df['label'].values,
+                "complex_ids": split_df['complex_id'].tolist(),
+            }
+            
+            # Oracle baseline: always predict the true quality (best possible)
+            all_results["Oracle"][split] = {
+                "predictions": split_df['label'].values,  # Perfect predictions
+                "true_dockq": split_df['label'].values,
+                "complex_ids": split_df['complex_id'].tolist(),
+            }
+
         # Model data
         for model_path in model_paths:
             model_id = model_ids[model_path]
@@ -483,18 +495,23 @@ def main():
                 model, config = load_model_and_config(model_path, device)
                 data_cfg = config.get('data', {})
                 
+                batch_size = data_cfg.get('batch_size_per_gpu', 16)
+                num_workers = data_cfg.get('num_workers', 20)
                 dataloader = get_eval_dataloader(
                     manifest_csv=manifest_path,
                     split=split,
-                    batch_size=args.batch_size,
-                    num_workers=args.num_workers,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
                     samples_per_complex=data_cfg.get('samples_per_complex', 10),
                     feature_transform=data_cfg.get('feature_transform', True),
                     feature_centering=data_cfg.get('feature_centering', False),
                     use_interchain_ca_distances=data_cfg.get('use_interchain_ca_distances', True),
                     use_interchain_pae=data_cfg.get('use_interchain_pae', True),
                     use_esm_embeddings=data_cfg.get('use_esm_embeddings', False),
+                    use_distance_cutoff=data_cfg.get('use_distance_cutoff', True),
                     use_file_cache=data_cfg.get('use_file_cache', True),
+                    cache_size_mb=data_cfg.get('cache_size_mb', 2048),
+                    max_cached_files=data_cfg.get('max_cached_files', 150),
                     seed=data_cfg.get('seed', 42)
                 )
                 
@@ -507,10 +524,10 @@ def main():
                         "complex_ids": cids,
                     }
                     print(f"  {model_id}: {len(preds)} samples")
-                
+
             except Exception as e:
                 print(f"  Error with {model_id}: {e}")
-    
+
     # Compute metrics
     print("\n=== Computing Metrics ===")
     all_metrics = defaultdict(lambda: defaultdict(dict))
@@ -540,7 +557,7 @@ def main():
             metrics['Avg_PerComplex_Spearman'] = np.mean(per_complex_spearman) if per_complex_spearman else np.nan
             
             # Top-K metrics
-            topk_metrics = compute_topk_metrics(preds, true_dockq, cids, k_values=[1, 3])
+            topk_metrics = compute_topk_metrics(preds, true_dockq, cids, k_values=[1])
             metrics.update(topk_metrics)
             
             # Quality discrimination
@@ -554,7 +571,7 @@ def main():
         os.makedirs(split_dir, exist_ok=True)
         
         combined_data_dockq = []
-        
+
         for model_id in all_results.keys():
             if split not in all_results[model_id]:
                 continue
@@ -593,9 +610,7 @@ def main():
             ('Pearson_DockQ', 'Pearson Correlation', False),
             ('MSE_DockQ', 'Mean Squared Error', True),
             ('Top1_mean_quality', 'Top-1 Mean Quality', False),
-            ('Top3_mean_quality', 'Top-3 Mean Quality', False),
             ('Top1_success_rate', 'Top-1 Success Rate', False),
-            ('Top3_success_rate', 'Top-3 Success Rate', False),
         ]
         
         for metric_key, metric_title, lower_better in metric_names:
@@ -627,7 +642,7 @@ def main():
                 else:
                     row[k] = str(v)
             report_data.append(row)
-    
+
     if report_data:
         df_summary = pd.DataFrame(report_data)
         
@@ -641,23 +656,42 @@ def main():
         print(df_summary.to_string(index=False))
         print("="*80)
         
-        # Print best performers
+        # Print performance comparison vs Random, Baseline, and Oracle
+        # calculated as (model_val - baseline_val) / abs(baseline_val) * 100
         for split in splits:
-            df_split = df_summary[df_summary['Split'] == split]
+            df_split = df_summary[df_summary['Split'] == split].copy()
             if df_split.empty:
                 continue
             
-            print(f"\n=== Best Performers - Split: {split} ===")
+            print(f"\n=== Performance Comparison - Split: {split} ===")
+            random_row = df_split[df_split['Model'] == 'Random']
+            baseline_row = df_split[df_split['Model'] == baseline_id]
             
-            # Convert to numeric for comparison
-            for col in ['Spearman_DockQ', 'Top1_mean_quality', 'Top3_mean_quality']:
-                if col in df_split.columns:
-                    df_split[col] = pd.to_numeric(df_split[col], errors='coerce')
-                    if df_split[col].notna().sum() > 0:
-                        best_idx = df_split[col].idxmax()
-                        best = df_split.loc[best_idx]
-                        print(f"  Best {col}: {best['Model']} ({best[col]:.4f})")
-    
+            for col in ['Spearman_DockQ', 'Top1_mean_quality', 'Top1_success_rate']:
+                if col not in df_split.columns:
+                    continue
+                df_split[col] = pd.to_numeric(df_split[col], errors='coerce')
+                print(f"\n  {col}:")
+                for idx, row in df_split.iterrows():
+                    model_val = row[col]
+                    if row['Model'] in ['Random', 'Baseline', 'Oracle']:
+                        print(f"    {row['Model']}: {model_val:.4f}")
+                    else:
+                        # For trained models, show % vs Random and Baseline
+                        parts = [f"    {row['Model']}: {model_val:.4f} ("]
+                        if len(random_row) > 0:
+                            random_val = pd.to_numeric(random_row[col].values[0], errors='coerce')
+                            if not np.isnan(random_val) and random_val != 0:
+                                pct_vs_random = ((model_val - random_val) / abs(random_val)) * 100
+                                parts.append(f"{pct_vs_random:+.1f}% vs Random, ")
+                        if len(baseline_row) > 0:
+                            baseline_val = pd.to_numeric(baseline_row[col].values[0], errors='coerce')
+                            if not np.isnan(baseline_val) and baseline_val != 0:
+                                pct_vs_baseline = ((model_val - baseline_val) / abs(baseline_val)) * 100
+                                parts.append(f"{pct_vs_baseline:+.1f}% vs Baseline")
+                        parts.append(")")
+                        print("".join(parts))
+                        
     print(f"\nAll outputs saved to: {args.output_dir}")
 
 

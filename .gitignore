@@ -2,6 +2,8 @@
 data/*
 !data/manifest.csv
 
+comparison_reports*/
+
 wandb/*
 
 # Ignore all files in the logs directory

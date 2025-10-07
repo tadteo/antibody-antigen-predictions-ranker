@@ -423,13 +423,13 @@ class PerComplexSequentialSampler(torch.utils.data.Sampler):
     """
     Deterministic, no-shuffle sampler for evaluation.
     Yields flat lists of indices of length B*K (B complexes × K decoys),
-    in manifest order. Drops the remainder if the last chunk/batch is shorter than B.
+    in manifest order. Pads the last batch by repeating chunks to ensure all data is evaluated.
     """
-    def __init__(self, dataset, batch_size: int, samples_per_complex: int):
+    def __init__(self, dataset, batch_size: int, samples_per_complex: int, pad_last_batch: bool = True):
         self.df = dataset.df                      # already split='val'
         self.batch_size = batch_size              # B
-        print(f"the batch size for the validation sampler is {self.batch_size}")
         self.K = samples_per_complex              # K
+        self.pad_last_batch = pad_last_batch
 
         # Complexes in manifest order (no shuffle)
         from collections import OrderedDict
@@ -448,11 +448,25 @@ class PerComplexSequentialSampler(torch.utils.data.Sampler):
                 chunk = rows[i:i+self.K]
                 self.chunks.append(chunk)
 
-        # Batch chunks deterministically into size B; drop if last batch is smaller than B
+        # Batch chunks deterministically into size B
         self.batches = []
         print(f"the batch size for the validation sampler is {self.batch_size}")
         for i in range(0, len(self.chunks), self.batch_size):
             batch_chunks = self.chunks[i:i+self.batch_size]
+            
+            # Pad incomplete batches if requested
+            if len(batch_chunks) < self.batch_size:
+                if self.pad_last_batch:
+                    # Pad by repeating chunks from the beginning
+                    needed = self.batch_size - len(batch_chunks)
+                    padding_chunks = self.chunks[:needed]
+                    batch_chunks.extend(padding_chunks)
+                    print(f"Padding last validation batch: added {needed} chunks to reach {self.batch_size} complexes")
+                else:
+                    print(f"Dropping incomplete validation batch with {len(batch_chunks)} complexes (expected {self.batch_size})")
+                    continue
+            
+            # Flatten to a single list of indices
             flat = [idx for ch in batch_chunks for idx in ch]
             self.batches.append(flat)
 
