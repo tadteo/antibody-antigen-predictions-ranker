@@ -1,3 +1,0 @@
-Model,Split,Pearson_DockQ,Spearman_DockQ,MSE_DockQ,Avg_PerComplex_Pearson_DockQ,Avg_PerComplex_Spearman_DockQ,Pearson_TM,Spearman_TM,MSE_TM
-Baseline (Ranking Confidence),val,0.5858,0.6097,0.0982,0.2298,0.1868,0.2078,0.2833,0.0743
-DeepSet_2025-10-06_21-55-13,val,0.8485,0.8084,0.0301,0.2556,0.2052,0.6175,0.5975,0.1513

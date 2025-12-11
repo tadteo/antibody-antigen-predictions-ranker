@@ -72,7 +72,7 @@ def pad_collate_fn(batch, batch_size, samples_per_complex):
     if not rows_equal:
         raise ValueError("All decoys in a row must share the same complex_id")
 
-    return {
+    result = {
       "features": padded,        # [B, K, N, F]
       "lengths":  lengths,       # [B, K]
       "label":    labels,        # [B, K]
@@ -80,6 +80,19 @@ def pad_collate_fn(batch, batch_size, samples_per_complex):
       "complex_id": complex_ids,  # [B, K]
       "ranking_score": ranking_score  # [B, K]
     }
+    
+    # Handle iptm and ptm if present in batch
+    if "iptm" in batch[0]:
+        iptm = torch.tensor([b["iptm"] for b in batch])   # (B·K,)
+        iptm = iptm.reshape(batch_size, samples_per_complex)
+        result["iptm"] = iptm  # [B, K]
+    
+    if "ptm" in batch[0]:
+        ptm = torch.tensor([b["ptm"] for b in batch])   # (B·K,)
+        ptm = ptm.reshape(batch_size, samples_per_complex)
+        result["ptm"] = ptm  # [B, K]
+    
+    return result
 
 # ==============================================================================
 # DistributedBatchSampler - Wrapper for DDP compatibility
@@ -377,7 +390,8 @@ class AntibodyAntigenPAEDataset(Dataset):
                  # Arguments kept for API compatibility but ignored/not used as before
                  use_file_cache: bool = False, 
                  cache_size_mb: int = 512,
-                 max_cached_files: int = 20):
+                 max_cached_files: int = 20,
+                 use_iptm_ptm: bool = False):
         
         print(f"Initializing In-Memory Dataset for split: {split}")
         self.df = pd.read_csv(manifest_csv)
@@ -391,6 +405,7 @@ class AntibodyAntigenPAEDataset(Dataset):
         self.use_esm_embeddings = use_esm_embeddings
         self.use_distance_cutoff = use_distance_cutoff
         self.distance_cutoff = distance_cutoff
+        self.use_iptm_ptm = use_iptm_ptm
         
         # Pre-load all data into memory
         self.samples = self._preload_data()
@@ -593,7 +608,7 @@ class AntibodyAntigenPAEDataset(Dataset):
             # Pre-compute weight tensor
             weight_val = row.weight if hasattr(row, "weight") and pd.notna(row.weight) else 1.0
 
-            return {
+            result = {
                 "features": torch.from_numpy(feats),
                 "label":    torch.tensor(label_val, dtype=torch.float32),
                 "weight":   torch.tensor(weight_val, dtype=torch.float32),
@@ -601,6 +616,15 @@ class AntibodyAntigenPAEDataset(Dataset):
                 "complex_id": complex_id,
                 "ranking_score": torch.tensor(ranking_score)
             }
+            
+            # Load iptm and ptm if enabled
+            if self.use_iptm_ptm:
+                iptm = original_sample_group["iptm"][()]
+                ptm = original_sample_group["ptm"][()]
+                result["iptm"] = torch.tensor(iptm, dtype=torch.float32)
+                result["ptm"] = torch.tensor(ptm, dtype=torch.float32)
+            
+            return result
         except Exception as e:
             print(f"Error loading sample {complex_id}/{sample_id}: {e}")
             raise
@@ -624,6 +648,7 @@ def get_eval_dataloader(manifest_csv: str,
                         use_file_cache: bool = True,
                         cache_size_mb: int = 512,
                         max_cached_files: int = 100,
+                        use_iptm_ptm: bool = False,
                         seed: int = None,
                         distributed: bool = False,
                         world_size: int = 1,
@@ -650,7 +675,8 @@ def get_eval_dataloader(manifest_csv: str,
         distance_cutoff=distance_cutoff,
         use_file_cache=use_file_cache, # Ignored but kept for interface
         cache_size_mb=cache_size_mb,
-        max_cached_files=max_cached_files
+        max_cached_files=max_cached_files,
+        use_iptm_ptm=use_iptm_ptm
     )
     
     local_batch_size = math.ceil(batch_size / world_size)
@@ -706,6 +732,7 @@ def get_dataloader(manifest_csv: str,
                    use_file_cache: bool = True,
                    cache_size_mb: int = 512,
                    max_cached_files: int = 100,
+                   use_iptm_ptm: bool = False,
                    seed: int = None,
                    distributed: bool = False,
                    world_size: int = 1,
@@ -731,7 +758,8 @@ def get_dataloader(manifest_csv: str,
         distance_cutoff=distance_cutoff,
         use_file_cache=use_file_cache, # Ignored but kept for interface
         cache_size_mb=cache_size_mb,
-        max_cached_files=max_cached_files
+        max_cached_files=max_cached_files,
+        use_iptm_ptm=use_iptm_ptm
     )
 
     # Calculate local batch size for distributed training

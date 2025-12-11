@@ -128,13 +128,6 @@ def create_distributed_collate_fn(local_batch_size: int, samples_per_complex: in
     return partial(pad_collate_fn, batch_size=local_batch_size, samples_per_complex=samples_per_complex)
 
 # ==============================================================================
-# Load our user‐config (e.g. number of models to draw per complex per epoch)
-# ==============================================================================
-with open('configs/config.yaml', 'r') as f:
-    config = yaml.safe_load(f)
-
-
-# ==============================================================================
 #  Collate function
 # ==============================================================================
 
@@ -182,7 +175,7 @@ def pad_collate_fn(batch, batch_size, samples_per_complex):
     if not rows_equal:
         raise ValueError("All decoys in a row must share the same complex_id")
 
-    return {
+    result = {
       "features": padded,        # [B, K, N, F]
       "lengths":  lengths,       # [B, K]
       "label":    labels,        # [B, K]
@@ -190,6 +183,19 @@ def pad_collate_fn(batch, batch_size, samples_per_complex):
       "complex_id": complex_ids,  # [B, K]
       "ranking_score": ranking_score  # [B, K]
     }
+    
+    # Handle iptm and ptm if present in batch
+    if "iptm" in batch[0]:
+        iptm = torch.tensor([b["iptm"] for b in batch])   # (B·K,)
+        iptm = iptm.reshape(batch_size, samples_per_complex)
+        result["iptm"] = iptm  # [B, K]
+    
+    if "ptm" in batch[0]:
+        ptm = torch.tensor([b["ptm"] for b in batch])   # (B·K,)
+        ptm = ptm.reshape(batch_size, samples_per_complex)
+        result["ptm"] = ptm  # [B, K]
+    
+    return result
 
 # ==============================================================================
 # DistributedBatchSampler - Wrapper for DDP compatibility
@@ -508,7 +514,8 @@ class AntibodyAntigenPAEDataset(Dataset):
                  use_file_cache: bool = True,
                  cache_size_mb: int = 512,
                  max_cached_files: int = 20,
-                 max_n: int = 1500):
+                 max_n: int = 1500,
+                 use_iptm_ptm: bool = False):
         self.df = pd.read_csv(manifest_csv)
         # Filter to only this split
         self.df = self.df[self.df["split"] == split].reset_index(drop=True)
@@ -523,6 +530,7 @@ class AntibodyAntigenPAEDataset(Dataset):
         self.cache_size_mb = cache_size_mb
         self.max_cached_files = max_cached_files
         self.max_n = max_n  # Max interchain pairs to keep (None = no limit)
+        self.use_iptm_ptm = use_iptm_ptm
 
     def __len__(self):
         return len(self.df)
@@ -735,7 +743,7 @@ class AntibodyAntigenPAEDataset(Dataset):
             label = np.clip(label, epsilon, 1 - epsilon)
             label = np.log(label / (1 - label))
 
-            return {
+            result = {
                 "features": torch.from_numpy(feats),            # [3..5, n]
                 "label":    torch.tensor(label, dtype=torch.float32), # DockQ (logit transformed)
                 "weight":   torch.tensor(row["weight"]),         # importance weight
@@ -743,6 +751,15 @@ class AntibodyAntigenPAEDataset(Dataset):
                 "complex_id": complex_id,
                 "ranking_score": torch.tensor(ranking_score)
             }
+            
+            # Load iptm and ptm if enabled
+            if self.use_iptm_ptm:
+                iptm = original_sample_group["iptm"][()]
+                ptm = original_sample_group["ptm"][()]
+                result["iptm"] = torch.tensor(iptm, dtype=torch.float32)
+                result["ptm"] = torch.tensor(ptm, dtype=torch.float32)
+            
+            return result
         except Exception as e:
             print(f"Error loading sample {complex_id}/{sample_id}: {e}")
             raise
@@ -767,6 +784,7 @@ def get_eval_dataloader(manifest_csv: str,
                         cache_size_mb: int = 512,
                         max_cached_files: int = 20,
                         max_n: int = 1500,
+                        use_iptm_ptm: bool = False,
                         seed: int = None,
                         distributed: bool = False,
                         world_size: int = 1,
@@ -777,9 +795,9 @@ def get_eval_dataloader(manifest_csv: str,
     """
     if feature_transform:
         print("Val dataloader: Using triangular positional encoding")
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff, use_file_cache=use_file_cache, cache_size_mb=cache_size_mb, max_cached_files=max_cached_files, max_n=max_n)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff, use_file_cache=use_file_cache, cache_size_mb=cache_size_mb, max_cached_files=max_cached_files, max_n=max_n, use_iptm_ptm=use_iptm_ptm)
     else:
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff, use_file_cache=use_file_cache, cache_size_mb=cache_size_mb, max_cached_files=max_cached_files, max_n=max_n)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff, use_file_cache=use_file_cache, cache_size_mb=cache_size_mb, max_cached_files=max_cached_files, max_n=max_n, use_iptm_ptm=use_iptm_ptm)
     
     local_batch_size = math.ceil(batch_size / world_size)
 
@@ -844,6 +862,7 @@ def get_dataloader(manifest_csv: str,
                    cache_size_mb: int = 512,
                    max_cached_files: int = 20,
                    max_n: int = 1500,
+                   use_iptm_ptm: bool = False,
                    seed: int = None,
                    distributed: bool = False,
                    world_size: int = 1,
@@ -862,9 +881,9 @@ def get_dataloader(manifest_csv: str,
     """
     if feature_transform:
         print("Train dataloader: Using triangular positional encoding")
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff, use_file_cache=use_file_cache, cache_size_mb=cache_size_mb, max_cached_files=max_cached_files, max_n=max_n)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff, use_file_cache=use_file_cache, cache_size_mb=cache_size_mb, max_cached_files=max_cached_files, max_n=max_n, use_iptm_ptm=use_iptm_ptm)
     else:
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff, use_file_cache=use_file_cache, cache_size_mb=cache_size_mb, max_cached_files=max_cached_files, max_n=max_n)
+        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff, use_file_cache=use_file_cache, cache_size_mb=cache_size_mb, max_cached_files=max_cached_files, max_n=max_n, use_iptm_ptm=use_iptm_ptm)
 
     # Calculate local batch size for distributed training
     local_batch_size = math.ceil(batch_size / world_size)

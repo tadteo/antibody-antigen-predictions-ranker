@@ -3,10 +3,11 @@ import torch
 import torch.nn as nn
 import math
 class DeepSet(nn.Module):
-    def __init__(self, input_dim, phi_hidden_dims, rho_hidden_dims, output_dim=1, aggregator='sum'):
+    def __init__(self, input_dim, phi_hidden_dims, rho_hidden_dims, output_dim=1, aggregator='sum', sample_level_dim=0):
         super(DeepSet, self).__init__()
         
         self.aggregator = aggregator
+        self.sample_level_dim = sample_level_dim
         
         # Phi network applied to each element in the set
         phi_layers = []
@@ -36,6 +37,9 @@ class DeepSet(nn.Module):
         else:
             rho_input_dim = phi_hidden_dims[-1]
 
+        # Add sample-level features dimension (e.g., iptm and ptm)
+        rho_input_dim = rho_input_dim + sample_level_dim
+
         # Rho network applied after aggregation
         rho_layers = []
         prev_dim = rho_input_dim
@@ -48,8 +52,9 @@ class DeepSet(nn.Module):
         #No sigmoid here because we want to use Huber loss and it will choke the gradient 
         self.rho = nn.Sequential(*rho_layers)
 
-    def forward(self, x, lengths):
+    def forward(self, x, lengths, sample_features=None):
         # x: [batch_size, complex_size, set_size, input_dim]
+        # sample_features: [batch_size, complex_size, sample_level_dim] (optional, e.g., iptm and ptm)
         if not torch.isfinite(x).all():
             bad = ~torch.isfinite(x)
             # first bad index in (B,K,N,F)
@@ -204,6 +209,10 @@ class DeepSet(nn.Module):
             raise ValueError(f"Unknown aggregator: {self.aggregator}")
         
         # print(f"agg shape after aggregation and normalization: {agg.shape}")
+
+        # Concatenate sample-level features (e.g., iptm, ptm) if provided
+        if sample_features is not None:
+            agg = torch.cat([agg, sample_features], dim=-1)  # [B, K, agg_dim + sample_level_dim]
 
         # Rho network
         out = self.rho(agg)   # [B, K, output_dim]

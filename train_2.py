@@ -130,8 +130,7 @@ def soft_spearman_loss(pred, target, loss_type='one_minus_rho', tau=0.2):
     sr_pred = pairwise_soft_rank(pred,   tau)   # [B,K]
     sr_true = pairwise_soft_rank(target, tau)   # [B,K]
     
-    # mse = (sr_pred - sr_true).pow(2).sum(dim=-1) # per complex [B]
-    mse = (sr_pred - sr_true).pow(2).mean(dim=-1) # per complex [B]
+    mse = (sr_pred - sr_true).pow(2).sum(dim=-1) # per complex [B] - sum for correct Spearman formula
 
     denominator = K * (K**2 - 1)
     # If K < 2, denominator could be 0. Handled by K < 2 check above.
@@ -151,12 +150,12 @@ def soft_spearman_loss(pred, target, loss_type='one_minus_rho', tau=0.2):
     else:
         raise ValueError(f"Invalid loss type: {loss_type}")
 
-    return loss.mean()
+    return loss  # Return per-sample [B] for proper weighted combination
 
 def distance_preservation_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """
     pred, target: [B, K]
-    Returns: [B] loss per complex, averaged over batch
+    Returns: [B] loss per complex for proper weighted combination
     Computes sum of squared errors between pairwise absolute distances of pred and target.
     """
     B, K = pred.shape
@@ -175,7 +174,7 @@ def distance_preservation_loss(pred: torch.Tensor, target: torch.Tensor) -> torc
 
     # Sum squared errors per complex (no mean across batch)
     loss_per_complex = (diff ** 2).sum(dim=1)  # [B]
-    return loss_per_complex.mean()
+    return loss_per_complex  # Return per-sample [B] for proper weighted combination
 
 def main():
     # 1) Setup argument parsing
@@ -382,8 +381,11 @@ def main():
     use_file_cache = cfg.data.get('use_file_cache', True)
     cache_size_mb = cfg.data.get('cache_size_mb', 512)
     max_cached_files = cfg.data.get('max_cached_files', 20)
+    use_iptm_ptm = cfg.data.get('use_iptm_ptm', False)
+    sample_level_dim = 2 if use_iptm_ptm else 0  # iptm and ptm are 2 features
     print(f"Use interchain PAE: {use_interchain_pae}")
     print(f"Use ESM embeddings: {use_esm_embeddings} (dim={esm_embedding_dim})")
+    print(f"Use iptm/ptm sample-level features: {use_iptm_ptm} (sample_level_dim={sample_level_dim})")
 
     # adaptive weight: focus more on extreme targets (DockQ near 0 or 1)
     adaptive_weight = cfg.training.get('adaptive_weight', False)
@@ -428,6 +430,7 @@ def main():
         use_file_cache=use_file_cache,
         cache_size_mb=cache_size_mb,
         max_cached_files=max_cached_files,
+        use_iptm_ptm=use_iptm_ptm,
         seed=seed,
         distributed=is_distributed,
         world_size=world_size,
@@ -450,6 +453,7 @@ def main():
         use_file_cache=use_file_cache,
         cache_size_mb=cache_size_mb,
         max_cached_files=max_cached_files,
+        use_iptm_ptm=use_iptm_ptm,
         seed=seed,
         distributed=is_distributed,
         world_size=world_size,
@@ -467,7 +471,7 @@ def main():
     rho_hidden_dims  = cfg.model.rho_hidden_dims
     aggregator       = cfg.model.aggregator
     print(f"input_dim: {input_dim} (base={input_dim_base}, ca_dist={use_interchain_ca_distances}, esm={use_esm_embeddings})")
-    model = DeepSet(input_dim, phi_hidden_dims, rho_hidden_dims, aggregator=aggregator)
+    model = DeepSet(input_dim, phi_hidden_dims, rho_hidden_dims, aggregator=aggregator, sample_level_dim=sample_level_dim)
     model.apply(init_weights)
 
     # Setup device and move model
@@ -740,7 +744,8 @@ def main():
                 add_rank_this_epoch, add_distance_this_epoch, spearman_tau, ranking_loss_type,
                 ranking_lambda=ranking_lambda, # Use fixed ranking lambda
                 distance_lambda=distance_lambda, # Use fixed distance lambda
-                fabric=fabric  # Pass fabric for autocast and backward
+                fabric=fabric,  # Pass fabric for autocast and backward
+                use_iptm_ptm=use_iptm_ptm
             )
 
             # Update learning rate per step for schedulers that are step-wise
@@ -819,7 +824,8 @@ def main():
                 spearman_tau=spearman_tau,
                 ranking_lambda=ranking_lambda,
                 distance_lambda=distance_lambda,
-                ranking_loss_type=ranking_loss_type
+                ranking_loss_type=ranking_loss_type,
+                use_iptm_ptm=use_iptm_ptm
             )
             
             val_loss_scalar = float(val_results['loss'])
@@ -1045,7 +1051,7 @@ def main():
 def run_validation(model, val_loader, base_criterion, device, weighted_loss, 
                   add_ranking_loss=False, add_distance_preservation_loss=False, 
                   spearman_tau=0.02, ranking_lambda=1.0, distance_lambda=1.0,
-                  ranking_loss_type='one_minus_rho'):
+                  ranking_loss_type='one_minus_rho', use_iptm_ptm=False):
     """
     Enhanced validation function that computes the same losses as training:
     - Regression loss
@@ -1083,7 +1089,14 @@ def run_validation(model, val_loader, base_criterion, device, weighted_loss,
             complex_ids.update(tmp_complex_ids)
             ranking_score = batch['ranking_score'].to(device)
 
-            logits = model(feats, lengths)
+            # Prepare sample-level features (iptm and ptm) if enabled
+            sample_features = None
+            if use_iptm_ptm:
+                iptm = batch['iptm'].to(device)  # [B, K]
+                ptm = batch['ptm'].to(device)    # [B, K]
+                sample_features = torch.stack([iptm, ptm], dim=-1)  # [B, K, 2]
+
+            logits = model(feats, lengths, sample_features=sample_features)
             logits = torch.clamp(logits, min=-100.0, max=100.0)
             
             # =============== REGRESSION LOSS ===============
@@ -1219,7 +1232,8 @@ def train_step(model, batch, optimizer, base_criterion, device,
                add_ranking_loss, add_distance_preservation_loss, spearman_tau, ranking_loss_type,
                ranking_lambda=1.0,          # Fixed ranking lambda
                distance_lambda=1.0,         # Fixed distance lambda
-               fabric=None):                # Lightning Fabric for autocast and backward                        
+               fabric=None,                 # Lightning Fabric for autocast and backward
+               use_iptm_ptm=False):         # Whether to use iptm/ptm sample-level features                        
     """
     Fabric-safe training step with fixed lambdas:
       - single forward (under autocast)
@@ -1269,6 +1283,13 @@ def train_step(model, batch, optimizer, base_criterion, device,
     weights = batch['weight'].to(device)
     # complex_id = batch['complex_id']  # not used here
     
+    # Prepare sample-level features (iptm and ptm) if enabled
+    sample_features = None
+    if use_iptm_ptm:
+        iptm = batch['iptm'].to(device)  # [B, K]
+        ptm = batch['ptm'].to(device)    # [B, K]
+        sample_features = torch.stack([iptm, ptm], dim=-1)  # [B, K, 2]
+    
     # print(f"feats shape: {feats.shape}")
     avg_dockq = torch.sigmoid(labels).mean().item()
     params = [p for p in model.parameters() if p.requires_grad]
@@ -1284,7 +1305,7 @@ def train_step(model, batch, optimizer, base_criterion, device,
     # ------------------- forward + base losses -------------------
     def compute_losses():
                    
-        logits = model(feats, lengths)  # [B, K] predictions in logit space
+        logits = model(feats, lengths, sample_features=sample_features)  # [B, K] predictions in logit space
         logits = torch.clamp(logits, min=-100.0, max=100.0)
         
         # regression loss on logits vs labels (already in logit space)
