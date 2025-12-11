@@ -7,7 +7,7 @@ data:
   feature_transform: true
   feature_centering: true
   batch_size: 2 #8 max batch for sum aggregators #6 max batch for concat_stats aggregator #4 max batch for attn_pool aggregator
-  num_workers: 8
+  num_workers: 4
   samples_per_complex: 5
   use_interchain_ca_distances: true
   

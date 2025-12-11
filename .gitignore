@@ -1,7 +1,7 @@
 # Ignore all files in the data directory except for the manifest.csv
 data/*
 !data/manifest.csv
-
+*results*
 comparison_reports*/
 
 wandb/*

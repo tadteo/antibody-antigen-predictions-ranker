@@ -12,113 +12,8 @@ from functools import partial
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, Sampler
 import torch.nn.functional as F
 from src.data.triangular_positional_encoding import triangular_encode_features
-from threading import Lock
+from tqdm import tqdm
 import gc
-import atexit
-import weakref
-
-# ==============================================================================
-# HDF5 File Handle Cache (per-worker)
-# ==============================================================================
-class H5FileCache:
-    """
-    Thread-safe cache for HDF5 file handles. Keeps files open for faster access.
-    Each DataLoader worker process will have its own instance.
-    """
-    def __init__(self, chunk_cache_size_mb=512, max_open_files=10):
-        self.cache = {}
-        self.lock = Lock()
-        self.chunk_cache_size = chunk_cache_size_mb * 1024 * 1024  # Convert to bytes
-        self.max_open_files = max_open_files
-        self.access_count = {}  # Track access frequency for LRU eviction
-        self._closed = False
-        
-        # Register cleanup on exit
-        atexit.register(self.close_all)
-        
-    def get_file(self, h5_path):
-        """Get an open HDF5 file handle, opening if necessary"""
-        if self._closed:
-            raise RuntimeError("Attempting to use closed H5FileCache")
-            
-        with self.lock:
-            if h5_path not in self.cache:
-                # If cache is full, remove least recently used file
-                if len(self.cache) >= self.max_open_files:
-                    lru_path = min(self.access_count, key=self.access_count.get)
-                    try:
-                        self.cache[lru_path].close()
-                    except Exception as e:
-                        print(f"Warning: Error closing HDF5 file {lru_path}: {e}")
-                    del self.cache[lru_path]
-                    del self.access_count[lru_path]
-                
-                # Open file with optimized settings
-                try:
-                    self.cache[h5_path] = h5py.File(
-                        h5_path, 'r',
-                        rdcc_nbytes=self.chunk_cache_size,  # Chunk cache size
-                        rdcc_nslots=10007,  # Prime number for hash table
-                        rdcc_w0=0.75  # Preemption policy (0.75 = balanced)
-                    )
-                    self.access_count[h5_path] = 0
-                except Exception as e:
-                    print(f"Error opening HDF5 file {h5_path}: {e}")
-                    raise
-            
-            self.access_count[h5_path] += 1
-            return self.cache[h5_path]
-    
-    def close_all(self):
-        """Close all cached file handles"""
-        if self._closed:
-            return
-            
-        with self.lock:
-            for path, f in list(self.cache.items()):
-                try:
-                    if f is not None and hasattr(f, 'close'):
-                        f.close()
-                except Exception as e:
-                    print(f"Warning: Error closing HDF5 file {path}: {e}")
-            self.cache.clear()
-            self.access_count.clear()
-            self._closed = True
-    
-    def __del__(self):
-        try:
-            self.close_all()
-        except:
-            pass
-
-# Global cache - will be separate per worker process due to fork/spawn
-_worker_file_cache = None
-
-def get_worker_file_cache(chunk_cache_size_mb=512, max_open_files=20):
-    """Get or create the file cache for this worker"""
-    global _worker_file_cache
-    if _worker_file_cache is None:
-        _worker_file_cache = H5FileCache(chunk_cache_size_mb, max_open_files)
-    return _worker_file_cache
-
-def cleanup_worker():
-    """Cleanup function to be called when DataLoader worker shuts down"""
-    global _worker_file_cache
-    if _worker_file_cache is not None:
-        try:
-            _worker_file_cache.close_all()
-        except Exception as e:
-            print(f"Warning: Error during worker cleanup: {e}")
-        finally:
-            _worker_file_cache = None
-    
-    # Force garbage collection to clean up any remaining references
-    gc.collect()
-
-def worker_init_fn(worker_id):
-    """Initialize worker and register cleanup on exit"""
-    # Register cleanup function to be called when worker exits
-    atexit.register(cleanup_worker)
 
 # ==============================================================================
 # Helper functions for distributed training
@@ -130,9 +25,12 @@ def create_distributed_collate_fn(local_batch_size: int, samples_per_complex: in
 # ==============================================================================
 # Load our user‐config (e.g. number of models to draw per complex per epoch)
 # ==============================================================================
-with open('configs/config.yaml', 'r') as f:
-    config = yaml.safe_load(f)
-
+# We try to load config, but if it fails (e.g. file not found), we continue as it might not be needed
+try:
+    with open('configs/config.yaml', 'r') as f:
+        config = yaml.safe_load(f)
+except Exception:
+    config = {}
 
 # ==============================================================================
 #  Collate function
@@ -169,14 +67,6 @@ def pad_collate_fn(batch, batch_size, samples_per_complex):
     weights = weights.reshape(batch_size, samples_per_complex)
     complex_ids = np.array(complex_ids).reshape(batch_size, samples_per_complex)
 
-    # print(f"labels shape: {labels.shape}")
-    # print(f"weights shape: {weights.shape}")
-    # print(f"lengths shape: {lengths.shape}")
-    # print(f"complex_ids shape: {complex_ids.shape}")
-
-    # Check that all complex_ids in the last dimension are the same
-    # if not np.all(complex_ids[:, 0] == complex_ids[:, 1]):
-    #     raise ValueError("All complex_ids in the last dimension must be the same")
     # Ensure all K decoys per B row belong to the same complex
     rows_equal = np.all([len(set(row)) == 1 for row in complex_ids.tolist()])
     if not rows_equal:
@@ -308,7 +198,6 @@ class WeightedComplexSampler(Sampler):
         # (1)  sort rows by length – ascending or descending
         df_sorted = self.df.sort_values("len_sample", ascending=True)   # or False for longest-first
         
-
         # (2)  build an ordered mapping  {cid: {...}}  in that length order
         self.by_cid = OrderedDict(
             (
@@ -339,19 +228,9 @@ class WeightedComplexSampler(Sampler):
         Yields a list of indices whose length is exactly
             batch_size * samples_per_complex   ==  B · K
         except for the very last batch, which may be smaller.
-
-        ── notation used below ───────────────────────────────────────────────
-        B : self.batch_size
-        K : self.samples_per_complex
-        rng : self.rng   (numpy RandomState)
-        by_cid : {cid: [row-indices]}
-        row_w  : 1-D numpy array with a weight per *row*  (only if self.wtd)
-        ──────────────────────────────────────────────────────────────────────
         """
 
         if self.weighted:
-
-
             current_batch = []          # list of row-indices that we'll yield
             complexes_in_batch = 0      # how many distinct complexes already in list
 
@@ -383,7 +262,6 @@ class WeightedComplexSampler(Sampler):
                 yield current_batch
         else:
             # Take all the chunks from each complex (not ordering for padding but never mind)
-
             # Shuffle the chunks
             self.rng.shuffle(self.chunks)
             # Yield the chunks
@@ -405,9 +283,7 @@ class WeightedComplexSampler(Sampler):
                 flat_indices = [idx for chunk in tmp for idx in chunk]
                 # Yield the flat indices    
                 yield flat_indices
-
     
-
     # -------------------------------------------------------
     def __len__(self):
         if self.weighted:
@@ -478,22 +354,15 @@ class PerComplexSequentialSampler(torch.utils.data.Sampler):
         return len(self.batches)
 
 
-
 # ==============================================================================
-#  Dataset: load features on‐the‐fly from your H5 files
+#  Dataset: In-Memory Implementation
 # ==============================================================================
 class AntibodyAntigenPAEDataset(Dataset):
     """
-    Reads the manifest to know which H5-file + group corresponds to each sample.
-    On __getitem__:
-      - Opens the H5 (context‐managed)
-      - Pulls out the PAE interface indexes and values
-      - Returns a dict:
-          {
-            "features": Tensor([3 or 4, n]),
-            "label":    Tensor(scalar DockQ),
-            "weight":   Tensor(scalar importance weight)
-          }
+    In-memory dataset that pre-loads all samples from H5 files during initialization.
+    Performs filtering, distance cutoff, and feature transformation once at start-up.
+    
+    This avoids repetitive H5 file opening/closing and repeated preprocessing during training.
     """
     def __init__(self,
                  manifest_csv: str,
@@ -505,13 +374,16 @@ class AntibodyAntigenPAEDataset(Dataset):
                  use_esm_embeddings: bool = False,
                  use_distance_cutoff: bool = False,
                  distance_cutoff: float = 12.0,
-                 use_file_cache: bool = True,
+                 # Arguments kept for API compatibility but ignored/not used as before
+                 use_file_cache: bool = False, 
                  cache_size_mb: int = 512,
-                 max_cached_files: int = 20,
-                 max_n: int = 1500):
+                 max_cached_files: int = 20):
+        
+        print(f"Initializing In-Memory Dataset for split: {split}")
         self.df = pd.read_csv(manifest_csv)
         # Filter to only this split
         self.df = self.df[self.df["split"] == split].reset_index(drop=True)
+        
         self.feature_transform = feature_transform
         self.feature_centering = feature_centering
         self.use_interchain_pae = use_interchain_pae
@@ -519,51 +391,110 @@ class AntibodyAntigenPAEDataset(Dataset):
         self.use_esm_embeddings = use_esm_embeddings
         self.use_distance_cutoff = use_distance_cutoff
         self.distance_cutoff = distance_cutoff
-        self.use_file_cache = use_file_cache
-        self.cache_size_mb = cache_size_mb
-        self.max_cached_files = max_cached_files
-        self.max_n = max_n  # Max interchain pairs to keep (None = no limit)
+        
+        # Pre-load all data into memory
+        self.samples = self._preload_data()
+        
+        # After pre-loading, we can force a GC to clean up temporary buffers
+        gc.collect()
 
     def __len__(self):
-        return len(self.df)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        row        = self.df.iloc[idx]
-        h5_path    = row["h5_file"]
-        complex_id = row["complex_id"] # Original complex_id for this item
-        sample_id  = row["sample"]   # Original sample_id for this item
-        
-        # Load raw PAE data and create a 3xn with the interchain indexes and the interchain pae values
-        # Use cached file handle if enabled, otherwise use context manager for proper cleanup
-        if self.use_file_cache:
-            file_cache = get_worker_file_cache(self.cache_size_mb, self.max_cached_files)
-            hf = file_cache.get_file(h5_path)
-            # Use cached file - don't close it
-            return self._load_sample_data(hf, row, complex_id, sample_id)
-        else:
-            # Use context manager for automatic cleanup
-            with h5py.File(h5_path, 'r') as hf:
-                return self._load_sample_data(hf, row, complex_id, sample_id)
+        # Direct memory access - O(1)
+        return self.samples[idx]
     
-    def _load_sample_data(self, hf, row, complex_id, sample_id):
-        """Helper method to load sample data from an open HDF5 file handle"""
+    def _preload_data(self):
+        """
+        Iterates over the manifest grouped by H5 file, opens each file once, 
+        and processes all relevant samples. Returns a list of processed samples
+        aligned with self.df.
+        """
+        # Create a placeholder list of the correct size to fill in order
+        all_samples = [None] * len(self.df)
+        
+        # Group indices by H5 file path to minimize file opens
+        # We need to preserve the original DataFrame index to place processed samples correctly
+        self.df['orig_index'] = self.df.index
+        file_groups = self.df.groupby("h5_file")
+        
+        print(f"Loading {len(self.df)} samples from {len(file_groups)} unique H5 files...")
+        
+        for h5_path, group in tqdm(file_groups, desc="Loading H5 Files"):
+            try:
+                with h5py.File(h5_path, 'r') as hf:
+                    # Sort group by complex_id to allow caching the complex group
+                    # We convert to a list of namedtuples or similar for faster iteration than iterrows
+                    # But sorting the dataframe first is easiest
+                    group_sorted = group.sort_values("complex_id")
+                    
+                    current_complex_id = None
+                    current_complex_group = None
+                    
+                    # itertuples is significantly faster than iterrows
+                    for row in group_sorted.itertuples(index=False):
+                        idx = row.orig_index
+                        complex_id = row.complex_id
+                        sample_id = row.sample
+                        
+                        # Cache the complex group handle if we are still on the same complex
+                        if complex_id != current_complex_id:
+                            current_complex_id = complex_id
+                            current_complex_group = hf[complex_id]
+                        
+                        # Pass the complex group directly to avoid repeated dictionary lookups in h5py
+                        processed_sample = self._process_single_sample_optimized(
+                            current_complex_group, row, sample_id, complex_id
+                        )
+                        all_samples[idx] = processed_sample
+                        
+            except Exception as e:
+                print(f"Error reading file {h5_path}: {e}")
+                # We might want to raise here or continue, depending on desired robustness.
+                # For now, let's raise to be safe.
+                raise e
+                
+        # Remove the helper column
+        self.df.drop(columns=['orig_index'], inplace=True)
+        
+        # Verify no samples were missed
+        if any(s is None for s in all_samples):
+             raise RuntimeError("Some samples failed to load properly.")
+             
+        return all_samples
+
+    def _process_single_sample_optimized(self, complex_group, row, sample_id, complex_id):
+        """
+        Optimized helper method to load and process a single sample.
+        Args:
+            complex_group: h5py.Group object for the current complex
+            row: namedtuple from itertuples() containing metadata
+            sample_id: str
+            complex_id: str (passed for error reporting/structure)
+        """
         try:
             # Data for the primary sample
-            original_sample_group = hf[complex_id][sample_id]
+            original_sample_group = complex_group[sample_id]
+            
+            # Read datasets
+            # [()] reads the whole dataset into a numpy array
             interchain_pae_vals_raw = original_sample_group["interchain_pae_vals"][()]
             interchain_indexes_i = original_sample_group["inter_idx"][()]
             interchain_indexes_j = original_sample_group["inter_jdx"][()]
             ranking_score = original_sample_group["ranking_score"][()]
-            # Load residue one-letter codes to filter out X residues
             residue_one_letter = original_sample_group["residue_one_letter"][()]
-            # Convert bytes to strings if needed (HDF5 sometimes stores as bytes)
-            if isinstance(residue_one_letter[0], bytes):
+            
+            # Convert bytes to strings if needed
+            if len(residue_one_letter) > 0 and isinstance(residue_one_letter[0], bytes):
                 residue_one_letter = [res.decode('utf-8') for res in residue_one_letter]
 
             # Create mask for non-X residues
+            # Vectorized comparison if residue_one_letter is a numpy array of strings, 
+            # but usually it's a list or array of bytes. List comp is fast enough for small L.
             non_x_mask = np.array([res != 'X' for res in residue_one_letter])
             
-            # Filter interchain pairs: keep only pairs where both residues are not X
+            # Filter interchain pairs
             valid_pair_mask = non_x_mask[interchain_indexes_i] & non_x_mask[interchain_indexes_j]
 
             interchain_pae_vals_raw = interchain_pae_vals_raw[valid_pair_mask]
@@ -573,173 +504,100 @@ class AntibodyAntigenPAEDataset(Dataset):
             if not self.use_interchain_pae:
                 interchain_pae_vals_raw = None
 
-            # Optional: interchain Cα distances aligned by same indices
+            # Optional: interchain Cα distances
+            interchain_ca_distances_raw = None
             if self.use_interchain_ca_distances and 'interchain_ca_distances' in original_sample_group:
                 interchain_ca_distances_raw = original_sample_group['interchain_ca_distances'][()]
                 interchain_ca_distances_raw = interchain_ca_distances_raw[valid_pair_mask]
-            else:
-                interchain_ca_distances_raw = None
 
             # Remap indices to account for removed X residues
-            non_x_indices = np.where(non_x_mask)[0]
-            old_to_new_idx = np.full(len(residue_one_letter), -1, dtype=int)
-            old_to_new_idx[non_x_indices] = np.arange(len(non_x_indices))
-            
-            # Remap the indices
-            interchain_indexes_i = old_to_new_idx[interchain_indexes_i]
-            interchain_indexes_j = old_to_new_idx[interchain_indexes_j]
-
-            # Store distance mask before distance cutoff is applied
-            distance_mask = None
-            
-            # Optional: Apply distance cutoff to filter out far-away residue pairs
-            if self.use_distance_cutoff and interchain_ca_distances_raw is not None:
-                # Count pairs before filtering
-                n_pairs_before = len(interchain_ca_distances_raw)
+            # If no X residues, we can skip remapping? 
+            # Usually non_x_mask is all True.
+            if not np.all(non_x_mask):
+                non_x_indices = np.where(non_x_mask)[0]
+                old_to_new_idx = np.full(len(residue_one_letter), -1, dtype=int)
+                old_to_new_idx[non_x_indices] = np.arange(len(non_x_indices))
                 
-                # Keep only pairs where CA distance is below the cutoff
+                interchain_indexes_i = old_to_new_idx[interchain_indexes_i]
+                interchain_indexes_j = old_to_new_idx[interchain_indexes_j]
+            else:
+                # No X residues, indices remain valid (assuming 0-indexed contiguous)
+                pass
+
+            # Distance cutoff
+            distance_mask = None
+            if self.use_distance_cutoff and interchain_ca_distances_raw is not None:
                 distance_mask = interchain_ca_distances_raw <= self.distance_cutoff
                 n_pairs_after = distance_mask.sum()
-                n_filtered = n_pairs_before - n_pairs_after
-                pct_filtered = (n_filtered / n_pairs_before * 100) if n_pairs_before > 0 else 0.0
                 
-                # Debug output (first 10 samples only to avoid spam)
-                # print(f"[Distance Cutoff Debug] Sample {complex_id}/{sample_id}:")
-                # print(f"  Cutoff: {self.distance_cutoff} Å")
-                # print(f"  Pairs before: {n_pairs_before}")
-                # print(f"  Pairs after:  {n_pairs_after}")
-                # print(f"  Filtered out: {n_filtered} ({pct_filtered:.1f}%)")
-                # if n_pairs_after > 0:
-                #     print(f"  Distance range (kept): [{interchain_ca_distances_raw[distance_mask].min():.2f}, {interchain_ca_distances_raw[distance_mask].max():.2f}] Å")
-                
-                # IMPORTANT: If all pairs are filtered out, keep the closest pair to avoid empty samples
                 if n_pairs_after == 0:
-                    # Find the closest pair and keep it
                     closest_idx = np.argmin(interchain_ca_distances_raw)
                     distance_mask = np.zeros(len(interchain_ca_distances_raw), dtype=bool)
                     distance_mask[closest_idx] = True
-                    # print(f"WARNING: Sample {complex_id}/{sample_id} - all pairs beyond cutoff {self.distance_cutoff}Å. "
-                    #       f"Keeping closest pair at {interchain_ca_distances_raw[closest_idx]:.2f}Å to avoid empty sample.")
                 
-                # Apply mask to all arrays
                 interchain_indexes_i = interchain_indexes_i[distance_mask]
                 interchain_indexes_j = interchain_indexes_j[distance_mask]
                 if interchain_pae_vals_raw is not None:
                     interchain_pae_vals_raw = interchain_pae_vals_raw[distance_mask]
                 interchain_ca_distances_raw = interchain_ca_distances_raw[distance_mask]
 
-            # Sort by CA distance (ascending) and truncate to max_n
-            sort_indices = None  # Track for later use with pae_col_mean
-            if self.max_n is not None and interchain_ca_distances_raw is not None:
-                n_pairs = len(interchain_ca_distances_raw)
-                if n_pairs > 0:
-                    # Sort indices by CA distance (ascending - closest first)
-                    sort_indices = np.argsort(interchain_ca_distances_raw)
-                    # Truncate to max_n
-                    if n_pairs > self.max_n:
-                        sort_indices = sort_indices[:self.max_n]
-                    # Apply sorting to all arrays
-                    interchain_indexes_i = interchain_indexes_i[sort_indices]
-                    interchain_indexes_j = interchain_indexes_j[sort_indices]
-                    interchain_ca_distances_raw = interchain_ca_distances_raw[sort_indices]
-                    if interchain_pae_vals_raw is not None:
-                        interchain_pae_vals_raw = interchain_pae_vals_raw[sort_indices]
+            # ESM embeddings
+            esm_i = None
+            esm_j = None
+            if self.use_esm_embeddings and 'esm_embeddings' in original_sample_group:
+                esm_embeddings_raw = original_sample_group['esm_embeddings'][()]
+                esm_embeddings = esm_embeddings_raw[non_x_mask]
+                esm_i = esm_embeddings[interchain_indexes_i]
+                esm_j = esm_embeddings[interchain_indexes_j]
 
-            # Optional: ESM embeddings (stored at complex level, shared by all samples)
-            # print(f"use_esm_embeddings: {self.use_esm_embeddings}")
-            # print(f"esm_embeddings in hf[complex_id]: {'esm_embeddings' in hf[complex_id]}")
-            if self.use_esm_embeddings and 'esm_embeddings' in hf[complex_id]:
-                esm_embeddings_raw = hf[complex_id]['esm_embeddings'][()]  # [L, d_esm]
-                # print(f"esm_embeddings_raw shape: {esm_embeddings_raw.shape}")
-                # Filter to remove X residues
-                esm_embeddings = esm_embeddings_raw[non_x_mask]  # [L', d_esm]
-                # print(f"esm_embeddings shape: {esm_embeddings.shape}")
-                # Extract embeddings for interchain pairs (after distance filtering)
-                esm_i = esm_embeddings[interchain_indexes_i]  # [n, d_esm]
-                esm_j = esm_embeddings[interchain_indexes_j]  # [n, d_esm]
-            else:
-                esm_i = None
-                esm_j = None
-
-            label = row["label"] # Scalar label for the single sample case
+            # Construct features
+            # Use lists for stacking if possible, but numpy array construction is standard
+            feature_list = [interchain_indexes_i, interchain_indexes_j]
+            
             if interchain_pae_vals_raw is not None:
-                if not self.feature_centering:
-                    # Base features: indices and interchain PAE
-                    if interchain_ca_distances_raw is not None:
-                        feats = np.array([
-                            interchain_indexes_i,
-                            interchain_indexes_j,
-                            interchain_pae_vals_raw,
-                            interchain_ca_distances_raw,
-                        ], dtype=np.float32)
-                    else:
-                        feats = np.array([
-                            interchain_indexes_i,
-                            interchain_indexes_j,
-                            interchain_pae_vals_raw
-                        ], dtype=np.float32)
-                else:
-                    pae_col_mean = hf[complex_id]["pae_col_mean"][()]
+                if self.feature_centering:
+                    pae_col_mean = complex_group["pae_col_mean"][()]
                     pae_col_mean = pae_col_mean[valid_pair_mask]
-                    # Apply distance mask if used
                     if distance_mask is not None:
                         pae_col_mean = pae_col_mean[distance_mask]
-                    # Apply sort/truncation if used
-                    if sort_indices is not None:
-                        pae_col_mean = pae_col_mean[sort_indices]
-
-                    # pae_col_std = hf[complex_id]["pae_col_std"][()] # Not currently used for centering
+                    
                     interchain_pae_vals_centered = interchain_pae_vals_raw - pae_col_mean
-                    # If interchain ca distances are available, add them to the features
-                    if interchain_ca_distances_raw is not None:
-                        feats = np.array([
-                            interchain_indexes_i,
-                            interchain_indexes_j,
-                            pae_col_mean,
-                            interchain_pae_vals_centered,
-                            interchain_ca_distances_raw,
-                        ], dtype=np.float32)
-                    else:
-                        feats = np.array([
-                            interchain_indexes_i,
-                            interchain_indexes_j,
-                            pae_col_mean,
-                            interchain_pae_vals_centered,
-                        ], dtype=np.float32)
-            else:
-                feats = np.array([
-                    interchain_indexes_i,
-                    interchain_indexes_j,
-                    interchain_ca_distances_raw,
-                ], dtype=np.float32)
+                    feature_list.append(pae_col_mean)
+                    feature_list.append(interchain_pae_vals_centered)
+                else:
+                    feature_list.append(interchain_pae_vals_raw)
             
+            if interchain_ca_distances_raw is not None:
+                feature_list.append(interchain_ca_distances_raw)
+                
+            feats = np.array(feature_list, dtype=np.float32)
 
-            # Add ESM embeddings if enabled
+            # Add ESM embeddings
             if esm_i is not None and esm_j is not None:
-                # Transpose ESM embeddings to match feature format [d_esm, n]
-                esm_i_T = esm_i.T.astype(np.float32)  # [d_esm, n]
-                esm_j_T = esm_j.T.astype(np.float32)  # [d_esm, n]
-                # Concatenate along feature dimension
-                feats = np.vstack([feats, esm_i_T, esm_j_T])  # [F + 2*d_esm, n]
-                # print(f"feats shape after adding ESM embeddings: {feats.shape}")
+                # Transpose: (N, D) -> (D, N)
+                esm_i_T = esm_i.T.astype(np.float32)
+                esm_j_T = esm_j.T.astype(np.float32)
+                feats = np.vstack([feats, esm_i_T, esm_j_T])
         
-            # Optional user‐provided transform (applies to feats)
+            # Transform
             if self.feature_transform:
                 feats = self.feature_transform(feats)
             
-            # print(f"feats shape: {feats.shape}")
-
-            # Transform label(s) using clipped logit - works element-wise if label is an array
-            # print(f"label before: {label}")
+            # Label
+            raw_label = row.label
             epsilon = 1e-6
-            label = np.clip(label, epsilon, 1 - epsilon)
-            label = np.log(label / (1 - label))
+            # Single scalar ops are fast
+            label_val = np.clip(raw_label, epsilon, 1 - epsilon)
+            label_val = np.log(label_val / (1 - label_val))
+            
+            # Pre-compute weight tensor
+            weight_val = row.weight if hasattr(row, "weight") and pd.notna(row.weight) else 1.0
 
             return {
-                "features": torch.from_numpy(feats),            # [3..5, n]
-                "label":    torch.tensor(label, dtype=torch.float32), # DockQ (logit transformed)
-                "weight":   torch.tensor(row["weight"]),         # importance weight
-                "length":   torch.tensor(len(feats[0])),         # length of the sample
+                "features": torch.from_numpy(feats),
+                "label":    torch.tensor(label_val, dtype=torch.float32),
+                "weight":   torch.tensor(weight_val, dtype=torch.float32),
+                "length":   torch.tensor(feats.shape[1], dtype=torch.int64),
                 "complex_id": complex_id,
                 "ranking_score": torch.tensor(ranking_score)
             }
@@ -765,8 +623,7 @@ def get_eval_dataloader(manifest_csv: str,
                         distance_cutoff: float = 12.0,
                         use_file_cache: bool = True,
                         cache_size_mb: int = 512,
-                        max_cached_files: int = 20,
-                        max_n: int = 1500,
+                        max_cached_files: int = 100,
                         seed: int = None,
                         distributed: bool = False,
                         world_size: int = 1,
@@ -775,25 +632,31 @@ def get_eval_dataloader(manifest_csv: str,
     DataLoader for evaluation: sequential (no shuffle), no special sampling.
     For distributed training, wraps with DistributedBatchSampler.
     """
+    # Note: feature_transform arg is a boolean flag in factory, but passed as function to Dataset
+    transform_fn = triangular_encode_features if feature_transform else None
+    
     if feature_transform:
         print("Val dataloader: Using triangular positional encoding")
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff, use_file_cache=use_file_cache, cache_size_mb=cache_size_mb, max_cached_files=max_cached_files, max_n=max_n)
-    else:
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff, use_file_cache=use_file_cache, cache_size_mb=cache_size_mb, max_cached_files=max_cached_files, max_n=max_n)
+    
+    dataset = AntibodyAntigenPAEDataset(
+        manifest_csv, 
+        split=split, 
+        feature_transform=transform_fn, 
+        feature_centering=feature_centering, 
+        use_interchain_pae=use_interchain_pae, 
+        use_interchain_ca_distances=use_interchain_ca_distances, 
+        use_esm_embeddings=use_esm_embeddings, 
+        use_distance_cutoff=use_distance_cutoff, 
+        distance_cutoff=distance_cutoff,
+        use_file_cache=use_file_cache, # Ignored but kept for interface
+        cache_size_mb=cache_size_mb,
+        max_cached_files=max_cached_files
+    )
     
     local_batch_size = math.ceil(batch_size / world_size)
 
     # Calculate local batch size for distributed training
     collate = create_distributed_collate_fn(local_batch_size, samples_per_complex)
-
-    # base_sampler = WeightedComplexSampler(
-    #         dataset,
-    #         samples_per_complex=samples_per_complex,
-    #         batch_size=batch_size,
-    #         weighted=False,
-    #         replacement=True,
-    #         seed=seed
-    #     )
 
     # --- Deterministic, sequential sampler for validation ---
     base_sampler = PerComplexSequentialSampler(
@@ -818,9 +681,9 @@ def get_eval_dataloader(manifest_csv: str,
         
     return DataLoader(dataset,
                       batch_sampler=sampler,
-                      num_workers=num_workers,
+                      num_workers=0, # Force 0 workers for in-memory dataset to avoid pickling overhead
                       pin_memory=True,
-                      persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
+                      persistent_workers=False,
                       collate_fn=collate)
 
 
@@ -842,29 +705,34 @@ def get_dataloader(manifest_csv: str,
                    distance_cutoff: float = 12.0,
                    use_file_cache: bool = True,
                    cache_size_mb: int = 512,
-                   max_cached_files: int = 20,
-                   max_n: int = 1500,
+                   max_cached_files: int = 100,
                    seed: int = None,
                    distributed: bool = False,
                    world_size: int = 1,
                    rank: int = 0):
     """
-    Priority of sampling strategies:
-      1) If both samples_per_complex and bucket_balance → use WeightedPerComplexSampler
-      2) If samples_per_complex only     → use PerComplexSampler (uniform within complex)
-      3) If bucket_balance only          → use WeightedRandomSampler (global)
-      4) Else                            → plain shuffle
-      
-    For distributed training:
-      - Wraps the base sampler with DistributedBatchSampler
-      - Calculates local_batch_size per rank
-      - Uses appropriate collate function
+    Factory for creating the training dataloader with the in-memory dataset.
     """
+    # Note: feature_transform arg is a boolean flag in factory, but passed as function to Dataset
+    transform_fn = triangular_encode_features if feature_transform else None
+
     if feature_transform:
         print("Train dataloader: Using triangular positional encoding")
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_transform=triangular_encode_features, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff, use_file_cache=use_file_cache, cache_size_mb=cache_size_mb, max_cached_files=max_cached_files, max_n=max_n)
-    else:
-        dataset = AntibodyAntigenPAEDataset(manifest_csv, split=split, feature_centering=feature_centering, use_interchain_pae=use_interchain_pae, use_interchain_ca_distances=use_interchain_ca_distances, use_esm_embeddings=use_esm_embeddings, use_distance_cutoff=use_distance_cutoff, distance_cutoff=distance_cutoff, use_file_cache=use_file_cache, cache_size_mb=cache_size_mb, max_cached_files=max_cached_files, max_n=max_n)
+
+    dataset = AntibodyAntigenPAEDataset(
+        manifest_csv, 
+        split=split, 
+        feature_transform=transform_fn, 
+        feature_centering=feature_centering, 
+        use_interchain_pae=use_interchain_pae, 
+        use_interchain_ca_distances=use_interchain_ca_distances, 
+        use_esm_embeddings=use_esm_embeddings, 
+        use_distance_cutoff=use_distance_cutoff, 
+        distance_cutoff=distance_cutoff,
+        use_file_cache=use_file_cache, # Ignored but kept for interface
+        cache_size_mb=cache_size_mb,
+        max_cached_files=max_cached_files
+    )
 
     # Calculate local batch size for distributed training
     local_batch_size = math.ceil(batch_size / world_size)
@@ -899,9 +767,9 @@ def get_dataloader(manifest_csv: str,
             
         return DataLoader(dataset,
                           batch_sampler=sampler,
-                          num_workers=num_workers,
+                          num_workers=0, # Force 0 workers for in-memory dataset
                           pin_memory=True,
-                          persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
+                          persistent_workers=False,
                           collate_fn=collate)
 
     # Case 2: uniform per complex
@@ -932,9 +800,9 @@ def get_dataloader(manifest_csv: str,
             
         return DataLoader(dataset,
                           batch_sampler=sampler,
-                          num_workers=num_workers,
+                          num_workers=0, # Force 0 workers for in-memory dataset
                           pin_memory=True,
-                          persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
+                          persistent_workers=False,
                           collate_fn=collate)
 
     if samples_per_complex is None:
@@ -964,9 +832,8 @@ def get_dataloader(manifest_csv: str,
             
         return DataLoader(dataset,
                           batch_sampler=sampler,
-                          num_workers=num_workers,
+                          num_workers=0, # Force 0 workers for in-memory dataset
                           pin_memory=True,
-                          persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
+                          persistent_workers=False,
                           collate_fn=collate)
-
 

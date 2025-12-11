@@ -126,7 +126,12 @@ def build_manifest(h5_dir, val_frac, test_frac, seed, out_csv, weight_strategy):
         complex_stats.loc[complex_stats['strata'].isin(small), 'strata'] = 'other'
     
     # 5) Perform splits, with fallback to mean‐only if needed
-    if test_frac and test_frac > 0.0:
+    if test_frac >= 1.0:
+        print("Test split is 1.0. Assigning all samples to test.")
+        test = complex_stats.copy()
+        train = complex_stats.iloc[0:0].copy()
+        val = complex_stats.iloc[0:0].copy()
+    elif test_frac and test_frac > 0.0:
         try:
             # first test split
             train_val, test = train_test_split(
@@ -270,9 +275,9 @@ def parse_args():
     )
     p.add_argument('--h5_dir', required=True,
                    help='Directory of complex subfolders containing .h5 files')
-    p.add_argument('--val_frac', type=float, default=0.1,
+    p.add_argument('--val_frac', type=float, default=0.0,
                    help='Fraction for validation split')
-    p.add_argument('--test_frac', type=float, default=0.0,
+    p.add_argument('--test_frac', type=float, default=1.0,
                    help='Fraction for test split')
     p.add_argument('--seed', type=int, default=42,
                    help='Random seed for reproducibility')
@@ -285,7 +290,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.val_frac + args.test_frac >= 1.0:
+    if args.val_frac + args.test_frac > 1.0:
         raise ValueError("val_frac + test_frac must be < 1.0")
     build_manifest(
         h5_dir=args.h5_dir,

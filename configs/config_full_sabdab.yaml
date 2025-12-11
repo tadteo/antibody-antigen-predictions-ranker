@@ -3,11 +3,11 @@ data:
   processed_dir: data/processed
   processed_file: processed_data.h5
   splits_dir: data/raw_splits
-  manifest_file: data/manifest_new_with_distance_filtered_pae_centered_density_with_clipping_500k_maxlen_esm.csv
+  manifest_file: data/full_sabdab_train_esm_density_with_clipping.csv
   feature_transform: true
   feature_centering: true
-  batch_size_per_gpu: 32 #8 max batch for sum aggregators #6 max batch for concat_stats aggregator #4 max batch for attn_pool aggregator
-  num_workers: 2
+  batch_size_per_gpu: 16 #8 max batch for sum aggregators #6 max batch for concat_stats aggregator #4 max batch for attn_pool aggregator
+  num_workers: 20
   samples_per_complex: 10
   use_interchain_ca_distances: true
   use_interchain_pae: true

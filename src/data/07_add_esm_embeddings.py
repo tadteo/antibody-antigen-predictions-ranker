@@ -93,13 +93,14 @@ def compute_esm_embeddings(sequence, model, tokenizer, device):
 
 def process_h5_file(input_path, output_path, model, tokenizer, device):
     """
-    Process a single H5 file to add ESM embeddings.
+    Process a single H5 file to add ESM embeddings at the complex level.
     
     This function:
     1. Reads an input H5 file containing antibody-antigen complex predictions
-    2. For each sample, extracts the residue_one_letter sequence
-    3. Computes ESM embeddings for the sequence
-    4. Saves all original data plus the ESM embeddings to a new H5 file
+    2. For each complex, extracts the residue_one_letter sequence from the first sample
+    3. Computes ESM embeddings ONCE per complex (since all samples share the same sequence)
+    4. Stores ESM embeddings at the complex level, not in each sample
+    5. Saves all original data plus the ESM embeddings to a new H5 file
     
     Args:
         input_path (str): Path to the input H5 file
@@ -118,44 +119,58 @@ def process_h5_file(input_path, output_path, model, tokenizer, device):
                 in_complex_group = in_hf[complex_id]
                 out_complex_group = out_hf.create_group(complex_id)
                 
-                # Handle complex-level datasets (like pae_col_mean, pae_col_median, etc.)
+                # Separate datasets and sample groups
+                complex_level_datasets = []
+                sample_groups = []
+                
                 for key in in_complex_group.keys():
                     item = in_complex_group[key]
-                    
-                    # If it's a dataset at complex level, copy it
                     if isinstance(item, h5py.Dataset):
-                        in_complex_group.copy(key, out_complex_group)
-                        continue
+                        complex_level_datasets.append(key)
+                    elif isinstance(item, h5py.Group):
+                        sample_groups.append(key)
+                
+                # Copy complex-level datasets (like pae_col_mean, pae_col_median, etc.)
+                for key in complex_level_datasets:
+                    in_complex_group.copy(key, out_complex_group)
+                
+                # Compute ESM embeddings ONCE using the first sample's sequence
+                esm_embeddings_computed = False
+                if sample_groups:
+                    first_sample_key = sample_groups[0]
+                    first_sample_group = in_complex_group[first_sample_key]
                     
-                    # If it's a group (sample), process it
-                    if isinstance(item, h5py.Group):
-                        sample_name = key
-                        in_sample_group = item
-                        out_sample_group = out_complex_group.create_group(sample_name)
+                    if 'residue_one_letter' in first_sample_group:
+                        residue_one_letter = first_sample_group['residue_one_letter'][()]
                         
-                        # Copy all existing datasets from the input sample
-                        for dataset_key in in_sample_group.keys():
-                            in_sample_group.copy(dataset_key, out_sample_group)
+                        try:
+                            embeddings = compute_esm_embeddings(residue_one_letter, model, tokenizer, device)
+                            
+                            # Verify dimensions match
+                            if len(embeddings) != len(residue_one_letter):
+                                print(f"  WARNING: Length mismatch for {complex_id}: "
+                                      f"sequence={len(residue_one_letter)}, embeddings={len(embeddings)}")
+                            else:
+                                # Add ESM embeddings at COMPLEX level (not sample level)
+                                out_complex_group.create_dataset('esm_embeddings', data=embeddings, compression='gzip')
+                                esm_embeddings_computed = True
                         
-                        # Compute and add ESM embeddings
-                        if 'residue_one_letter' in in_sample_group:
-                            residue_one_letter = in_sample_group['residue_one_letter'][()]
-                            
-                            try:
-                                embeddings = compute_esm_embeddings(residue_one_letter, model, tokenizer, device)
-                                
-                                # Verify dimensions match
-                                if len(embeddings) != len(residue_one_letter):
-                                    print(f"  WARNING: Length mismatch for {complex_id}/{sample_name}: "
-                                          f"sequence={len(residue_one_letter)}, embeddings={len(embeddings)}")
-                                else:
-                                    # Add ESM embeddings to output file
-                                    out_sample_group.create_dataset('esm_embeddings', data=embeddings, compression='gzip')
-                            
-                            except Exception as e:
-                                print(f"  ERROR computing embeddings for {complex_id}/{sample_name}: {e}")
-                        else:
-                            print(f"  WARNING: {complex_id}/{sample_name} missing residue_one_letter")
+                        except Exception as e:
+                            print(f"  ERROR computing embeddings for {complex_id}: {e}")
+                    else:
+                        print(f"  WARNING: {complex_id}/{first_sample_key} missing residue_one_letter")
+                
+                if not esm_embeddings_computed:
+                    print(f"  WARNING: Could not compute ESM embeddings for complex {complex_id}")
+                
+                # Copy all sample groups (without adding esm_embeddings to each)
+                for sample_name in sample_groups:
+                    in_sample_group = in_complex_group[sample_name]
+                    out_sample_group = out_complex_group.create_group(sample_name)
+                    
+                    # Copy all existing datasets from the input sample
+                    for dataset_key in in_sample_group.keys():
+                        in_sample_group.copy(dataset_key, out_sample_group)
         
         return f"Successfully processed {os.path.basename(input_path)}"
     

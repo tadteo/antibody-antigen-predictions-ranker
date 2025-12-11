@@ -7,11 +7,11 @@ data:
   feature_transform: true
   feature_centering: true
   batch_size_per_gpu: 32 #8 max batch for sum aggregators #6 max batch for concat_stats aggregator #4 max batch for attn_pool aggregator
-  num_workers: 2
+  num_workers: 8
   samples_per_complex: 10
   use_interchain_ca_distances: true
   use_interchain_pae: true
-  use_esm_embeddings: true
+  use_esm_embeddings: false
   esm_embedding_dim: 320
   use_distance_cutoff: true  # Enable filtering of residue pairs by distance
   distance_cutoff: 12.0  # Maximum CA distance in Angstroms (only used if use_distance_cutoff is true)
@@ -22,13 +22,13 @@ data:
 
 model:
   input_dim: 4
-  aggregator: concat_stats_by_set_size
+  aggregator: attn_pool_by_set_size
   phi_hidden_dims: [128, 32, 64]
   rho_hidden_dims: [256, 256, 256]
 
 training:
   adaptive_weight: true
-  epochs: 250
+  epochs: 300
   lr: !!float 5e-3
   weight_decay: !!float 1e-5
   smooth_l1_beta: 0.5

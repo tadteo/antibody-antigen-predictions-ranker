@@ -30,6 +30,9 @@ class DeepSet(nn.Module):
         elif self.aggregator == 'concat_stats_by_set_size':
             # mean + max + size => 2H + 1
             rho_input_dim = phi_hidden_dims[-1] * 2 + 1
+        elif self.aggregator == 'attn_pool_concat_stats':
+            # attn + sum + mean + max + size => 4H + 1
+            rho_input_dim = phi_hidden_dims[-1] * 4 + 1
         else:
             rho_input_dim = phi_hidden_dims[-1]
 
@@ -161,6 +164,42 @@ class DeepSet(nn.Module):
             normalized_phi_features = phi_derived_features
             
             agg = torch.cat([normalized_phi_features, size_feat], dim=2) # [B, K, 2H+1]
+        elif self.aggregator == 'attn_pool_concat_stats':
+            # 1. Calculate Standard Stats
+            sum_pool = (h * valid).sum(dim=2)              # [B, K, H]
+            mean_pool = sum_pool / counts                  # [B, K, H]
+            
+            neg_inf = -1e9
+            h_masked = h + (1.0 - valid) * neg_inf
+            max_pool, _ = h_masked.max(dim=2)              # [B, K, H]
+            
+            size_feat = counts.sqrt()                      # [B, K, 1]
+
+            # 2. Calculate Attention Pooling
+            # Q is broadcasted, K is projected hidden states
+            Q = self.pool_q.unsqueeze(0).expand(B*K, -1).unsqueeze(1)   # [B*K,1,H]
+            K_val = self.attn_w(h.view(B*K, N, -1))                     # [B*K,N,H]
+            scores = (Q * K_val).sum(-1) / math.sqrt(K_val.size(-1))    # [B*K,N]
+
+            current_mask = mask.view(B*K, N)
+            max_scores = scores.max(dim=1, keepdim=True)[0] # Stability trick
+            scores = scores - max_scores
+            scores = scores.masked_fill(current_mask == 0, float('-inf'))
+            
+            alpha = torch.softmax(scores, dim=1).unsqueeze(-1)          # [B*K,N,1]
+            attn_flat = (alpha * h.view(B*K,N,-1)).sum(dim=1)           # [B*K,H]
+            attn_pool = attn_flat.view(B, K, -1)                        # [B,K,H]
+
+            # 3. Concatenate (Attn, Sum, Mean, Max) -> 4H
+            phi_derived_features = torch.cat([attn_pool, sum_pool, mean_pool, max_pool], dim=2) 
+
+            # 4. Normalize the 4H features
+            mu = phi_derived_features.mean(dim=1, keepdim=True)
+            std = phi_derived_features.std(dim=1, keepdim=True)
+            normalized_features = (phi_derived_features - mu) / (std + epsilon)
+            
+            # 5. Append Size
+            agg = torch.cat([normalized_features, size_feat], dim=2) # [B, K, 4H + 1]
         else:
             raise ValueError(f"Unknown aggregator: {self.aggregator}")
         

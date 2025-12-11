@@ -19,6 +19,7 @@ import numpy as np
 from datetime import datetime
 from omegaconf import OmegaConf
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 from scipy.stats import spearmanr
 from tqdm import tqdm
 from collections import defaultdict
@@ -194,7 +195,7 @@ def main():
         help='Path to checkpoint file to resume training from. Overrides config file if specified.'
     )
     parser.add_argument(
-        '--precision', type=str, default="bf16-mixed",
+        '--precision', type=str, default="32",
         help='Training precision (32, 16-mixed, bf16-mixed)'
     )
     parser.add_argument(
@@ -367,6 +368,9 @@ def main():
     ranking_lambda = cfg.training.get('ranking_lambda', 10.0)
     distance_lambda = cfg.training.get('distance_lambda', 0.1)
     
+    # Validation frequency (run validation every n epochs)
+    val_every_n_epochs = cfg.training.get('val_every_n_epochs', 5)
+    
     feature_transform   = cfg.data.feature_transform
     feature_centering   = cfg.data.get('feature_centering', False)
     use_interchain_ca_distances = cfg.data.get('use_interchain_ca_distances', False)
@@ -434,8 +438,8 @@ def main():
         manifest_csv,
         split='val',
         batch_size=global_batch_size,
-        samples_per_complex=samples_per_complex,
         num_workers=num_workers,
+        samples_per_complex=samples_per_complex,
         feature_transform=feature_transform,
         feature_centering=feature_centering,
         use_interchain_ca_distances=use_interchain_ca_distances,
@@ -689,6 +693,10 @@ def main():
         epoch_start = time.time()
         training_start = time.time()
         
+        # Set epoch for distributed sampler (ensures different shuffling each epoch)
+        if hasattr(train_loader, 'batch_sampler') and hasattr(train_loader.batch_sampler, 'set_epoch'):
+            train_loader.batch_sampler.set_epoch(epoch)
+        
         # Initialize epoch-level metrics
         epoch_loss = 0.0
         epoch_avg_dockq = 0.0
@@ -713,8 +721,16 @@ def main():
         # Decide whether to use distance preservation loss this epoch
         add_distance_this_epoch = add_distance_preservation_loss and (epoch >= distance_loss_start_epoch)
 
+        first_batch_logged = False
         for batch in tqdm(train_loader, desc="Training epoch", disable=fabric.global_rank != 0):
             step += 1
+            
+            # Distributed training verification: log first batch info from each rank (epoch 1 only)
+            if epoch == 1 and not first_batch_logged:
+                complex_ids_sample = batch['complex_id'].flatten()[:3].tolist() if batch['complex_id'].size > 0 else []
+                fabric.print(f"[Rank {fabric.global_rank}] First batch complex_ids sample: {complex_ids_sample}")
+                first_batch_logged = True
+            
             combined_loss_val, current_batch_size, avg_dockq, \
             current_regression_loss, current_base_ranking_loss_val, current_base_distance_loss_val, \
             current_grad_norm_reg, current_grad_norm_rank, current_grad_norm_distance = train_step(
@@ -729,7 +745,12 @@ def main():
 
             # Update learning rate per step for schedulers that are step-wise
             if scheduler_type in ("OneCycleLR", "WarmupHoldLinear"):
-                learning_rate_scheduler.step()
+                if scheduler_type == "OneCycleLR":
+                    # Guard against exceeding total steps (dataloader length may not match actual batch count)
+                    if learning_rate_scheduler._step_count < learning_rate_scheduler.total_steps:
+                        learning_rate_scheduler.step()
+                else:
+                    learning_rate_scheduler.step()
             
             # Accumulate metrics for epoch-level logging
             epoch_loss += combined_loss_val
@@ -747,7 +768,7 @@ def main():
         # ---- END OF EPOCH TRAINING ----
         training_time = time.time() - training_start
         
-        # Calculate average metrics for the epoch
+        # Calculate average metrics for the epoch (local to each rank)
         avg_epoch_loss = epoch_loss / epoch_batch_count
         avg_epoch_dockq = epoch_avg_dockq / epoch_batch_count
         avg_epoch_regression_loss = epoch_regression_loss / epoch_batch_count
@@ -759,203 +780,202 @@ def main():
         avg_epoch_ranking_loss = epoch_ranking_loss / epoch_batch_count if add_rank_this_epoch else 0.0
         avg_epoch_distance_loss = epoch_distance_loss / epoch_batch_count if add_distance_this_epoch else 0.0
 
-        # ---- VALIDATION ----
-        validation_start = time.time()
-        fabric.barrier()
-        val_loss_scalar = 0.0  # init on all ranks so variable exists
+        # All-reduce training metrics across ranks for accurate global logging
+        if fabric.world_size > 1:
+            metrics_to_reduce = torch.tensor([
+                avg_epoch_loss,
+                avg_epoch_dockq,
+                avg_epoch_regression_loss,
+                avg_epoch_ranking_loss,
+                avg_epoch_distance_loss,
+            ], device=fabric.device, dtype=torch.float32)
+            
+            # Average across all ranks
+            metrics_reduced = fabric.all_reduce(metrics_to_reduce, reduce_op="mean")
+            
+            avg_epoch_loss = float(metrics_reduced[0])
+            avg_epoch_dockq = float(metrics_reduced[1])
+            avg_epoch_regression_loss = float(metrics_reduced[2])
+            avg_epoch_ranking_loss = float(metrics_reduced[3])
+            avg_epoch_distance_loss = float(metrics_reduced[4])
+
+        # ---- VALIDATION (every val_every_n_epochs epochs, first epoch, and last epoch) ----
+        run_validation_this_epoch = (epoch % val_every_n_epochs == 0) or (epoch == 1) or (epoch == epochs)
+        
+        validation_time = 0.0
+        val_loss_scalar = 0.0
         abs_err_mean_scalar = 0.0
+        avg_val_loss = 0.0
         
-        # Run validation on all ranks to avoid hanging
-        val_results = run_validation(
-            model, val_loader, base_criterion, device, weighted_loss,
-            add_ranking_loss=add_rank_this_epoch, 
-            add_distance_preservation_loss=add_distance_this_epoch,
-            spearman_tau=spearman_tau,
-            ranking_lambda=ranking_lambda,
-            distance_lambda=distance_lambda,
-            ranking_loss_type=ranking_loss_type
-        )
-        
-        val_loss_scalar = float(val_results['loss'])
-        validation_time = time.time() - validation_start
-        
-        # ----  NaN check (tensors, numpy arrays, numpy scalars, floats) ----
-        def _has_nan(x):
-            import numpy as _np
-            import torch as _torch
-            if isinstance(x, _torch.Tensor):
-                return _torch.isnan(x).any().item()
-            if isinstance(x, (np.ndarray, np.generic)):
-                return _np.isnan(x).any()
-            if isinstance(x, float):
-                return np.isnan(x)
-            return False
-
-        for key, val in val_results.items():
-            if _has_nan(val):
-                if fabric.global_rank == 0:
-                    print(f"{key}: contains NaN")
-                exit()
-
-        pcp = val_results['per_complex_points']
-        val_preds  = np.concatenate([pcp[c]['model'] for c in pcp.keys()])
-        val_labels = np.concatenate([pcp[c]['true']  for c in pcp.keys()])
-
-        # Check the difference between the predicted and true labels
-        errors = val_preds - val_labels
-        abs_errors = np.abs(errors)
-        abs_err_mean_scalar = float(abs_errors.mean())
-
-        # Only create plots and detailed logging on rank 0
-        if fabric.global_rank == 0:
-            # Extract complex IDs and per-complex metrics from the returned data
-            per_complex_points = val_results['per_complex_points']
-            cid = list(per_complex_points.keys())
+        if run_validation_this_epoch:
+            validation_start = time.time()
+            fabric.barrier()
             
-            rho_m = val_results['rho_true_per_complex']  # true rho for model predictions
-            delta = val_results['delta_true_rho_per_complex']  # delta true rho per complex
+            # Run validation on all ranks to avoid hanging
+            val_results = run_validation(
+                model, val_loader, base_criterion, device, weighted_loss,
+                add_ranking_loss=add_rank_this_epoch, 
+                add_distance_preservation_loss=add_distance_this_epoch,
+                spearman_tau=spearman_tau,
+                ranking_lambda=ranking_lambda,
+                distance_lambda=distance_lambda,
+                ranking_loss_type=ranking_loss_type
+            )
             
-            # Calculate baseline true rho by subtracting delta from model rho
-            rho_b = rho_m - delta
+            val_loss_scalar = float(val_results['loss'])
+            validation_time = time.time() - validation_start
 
-            n = min(len(cid), len(rho_m), len(rho_b), len(delta))
-            
-            # Debug information
-            print(f"Validation plotting debug:")
-            print(f"  - Number of complexes: {len(cid)}")
-            print(f"  - val_preds shape: {val_preds.shape}")
-            print(f"  - val_labels shape: {val_labels.shape}")
-            print(f"  - rho_m length: {len(rho_m)}")
-            print(f"  - delta length: {len(delta)}")
-            print(f"  - Sample val_preds range: {val_preds.min():.3f} to {val_preds.max():.3f}")
-            print(f"  - Sample val_labels range: {val_labels.min():.3f} to {val_labels.max():.3f}")
-            
-            # =============== TABLE 1: Per-complex prediction vs target ===============
-            # Only plot every 10 epochs
-            if epoch % 10 == 0 or epoch == 1:
-                # Create scatter plots for 10 random complexes
-                random_cids = random.sample(cid, 10)
-                print(f"Random complexes: {random_cids}")
+            pcp = val_results['per_complex_points']
+            val_preds  = np.concatenate([pcp[c]['model'] for c in pcp.keys()])
+            val_labels = np.concatenate([pcp[c]['true']  for c in pcp.keys()])
+
+            # Check the difference between the predicted and true labels
+            errors = val_preds - val_labels
+            abs_errors = np.abs(errors)
+            abs_err_mean_scalar = float(abs_errors.mean())
+
+            # Only create plots and detailed logging on rank 0
+            if fabric.global_rank == 0:
+                # Extract complex IDs and per-complex metrics from the returned data
+                per_complex_points = val_results['per_complex_points']
+                cid = list(per_complex_points.keys())
                 
-                for complex_id in random_cids:
-                    if complex_id in per_complex_points:
-                        complex_preds = np.array(per_complex_points[complex_id]['model'])
-                        complex_targets = np.array(per_complex_points[complex_id]['true'])
-                        
-                        if len(complex_preds) > 0 and len(complex_targets) > 0:
-                            # Create scatter plot for this complex
-                            fig, ax = plt.subplots(figsize=(8, 6))
-                            ax.scatter(complex_targets, complex_preds, alpha=0.6)
-                            ax.plot([0, 1], [0, 1], 'r--', alpha=0.8)  # diagonal line
-                            ax.set_xlabel('True DockQ')
-                            ax.set_ylabel('Predicted DockQ')
-                            ax.set_title(f'Complex {complex_id}: Prediction vs Target (Epoch {epoch})')
-                            ax.grid(True, alpha=0.3)
+                rho_m = val_results['rho_true_per_complex']  # true rho for model predictions
+                delta = val_results['delta_true_rho_per_complex']  # delta true rho per complex
+                
+                # Calculate baseline true rho by subtracting delta from model rho
+                rho_b = rho_m - delta
+
+                n = min(len(cid), len(rho_m), len(rho_b), len(delta))
+                
+                # =============== TABLE 1: Per-complex prediction vs target ===============
+                # Only plot every 50 epochs
+                if epoch % 50 == 0 or epoch == 1:
+                    # Create scatter plots for 5 random complexes
+                    random_cids = random.sample(cid, min(5, len(cid)))
+                    
+                    for complex_id in random_cids:
+                        if complex_id in per_complex_points:
+                            complex_preds = np.array(per_complex_points[complex_id]['model'])
+                            complex_targets = np.array(per_complex_points[complex_id]['true'])
                             
-                            # Add single row to table for this complex
-                            per_complex_table.add_data(
-                                epoch, str(complex_id), wandb.Image(fig)
-                            )
-                            plt.close(fig)
-            
-            # =============== TABLE 2: All complexes combined ===============
-            # Only plot every 10 epochs
-            if epoch % 10 == 0 or epoch == 1:
-                # Create combined scatter plot with colors by complex
-                print(f"Creating all complexes plot with {len(val_preds)} points from {len(cid)} complexes")
+                            if len(complex_preds) > 0 and len(complex_targets) > 0:
+                                # Create scatter plot for this complex
+                                fig, ax = plt.subplots(figsize=(8, 6))
+                                ax.scatter(complex_targets, complex_preds, alpha=0.6)
+                                ax.plot([0, 1], [0, 1], 'r--', alpha=0.8)  # diagonal line
+                                ax.set_xlabel('True DockQ')
+                                ax.set_ylabel('Predicted DockQ')
+                                ax.set_title(f'Complex {complex_id}: Prediction vs Target (Epoch {epoch})')
+                                ax.grid(True, alpha=0.3)
+                                
+                                # Add single row to table for this complex
+                                per_complex_table.add_data(
+                                    epoch, str(complex_id), wandb.Image(fig)
+                                )
+                                plt.close(fig)
                 
-                # Prepare colors for each complex
-                import matplotlib.cm as cm
+                # =============== TABLE 2: All complexes combined ===============
+                # Only plot every 50 epochs
+                if epoch % 50 == 0 or epoch == 1:
+                    # Create arrays for plotting with colors by complex
+                    plot_labels = []
+                    plot_preds = []
+                    plot_colors = []
+                    
+                    # Generate a color for each complex
+                    colormap = cm.get_cmap('tab20')  # Good for categorical data
+                    num_complexes = len(cid)
+                    
+                    for idx, complex_id in enumerate(cid):
+                        if complex_id in per_complex_points:
+                            complex_preds = np.array(per_complex_points[complex_id]['model'])
+                            complex_targets = np.array(per_complex_points[complex_id]['true'])
+                            
+                            if len(complex_preds) > 0 and len(complex_targets) > 0:
+                                plot_labels.extend(complex_targets.tolist())
+                                plot_preds.extend(complex_preds.tolist())
+                                # Assign same color to all points from this complex
+                                color = colormap(idx % 20)  # tab20 has 20 colors, cycle if needed
+                                plot_colors.extend([color] * len(complex_preds))
+                    
+                    plot_labels = np.array(plot_labels)
+                    plot_preds = np.array(plot_preds)
+                    
+                    fig, ax = plt.subplots(figsize=(12, 9))
+                    scatter = ax.scatter(plot_labels, plot_preds, c=plot_colors, alpha=0.6, s=20, edgecolors='none')
+                    ax.plot([0, 1], [0, 1], 'r--', alpha=0.8, linewidth=2)  # diagonal line
+                    ax.set_xlabel('True DockQ', fontsize=12)
+                    ax.set_ylabel('Predicted DockQ', fontsize=12)
+                    ax.set_title(f'All Complexes: Prediction vs Target (Epoch {epoch})\n{num_complexes} complexes, {len(plot_preds)} points', fontsize=13)
+                    ax.grid(True, alpha=0.3)
+                    
+                    # Add text annotation with statistics
+                    correlation = np.corrcoef(plot_labels, plot_preds)[0, 1]
+                    mae = np.mean(np.abs(plot_preds - plot_labels))
+                    info_text = f'Complexes: {num_complexes}\nTotal points: {len(plot_preds)}\nCorrelation: {correlation:.3f}\nMAE: {mae:.4f}'
+                    ax.text(0.05, 0.95, info_text, transform=ax.transAxes, 
+                            bbox=dict(boxstyle="round,pad=0.5", facecolor="white", alpha=0.9),
+                            verticalalignment='top', fontsize=10)
+                    
+                    all_complexes_table.add_data(epoch, wandb.Image(fig))
+                    plt.close(fig)
                 
-                # Create arrays for plotting with colors by complex
-                plot_labels = []
-                plot_preds = []
-                plot_colors = []
-                
-                # Generate a color for each complex
-                colormap = cm.get_cmap('tab20')  # Good for categorical data
-                num_complexes = len(cid)
-                
-                for idx, complex_id in enumerate(cid):
-                    if complex_id in per_complex_points:
-                        complex_preds = np.array(per_complex_points[complex_id]['model'])
-                        complex_targets = np.array(per_complex_points[complex_id]['true'])
-                        
-                        if len(complex_preds) > 0 and len(complex_targets) > 0:
-                            plot_labels.extend(complex_targets.tolist())
-                            plot_preds.extend(complex_preds.tolist())
-                            # Assign same color to all points from this complex
-                            color = colormap(idx % 20)  # tab20 has 20 colors, cycle if needed
-                            plot_colors.extend([color] * len(complex_preds))
-                
-                plot_labels = np.array(plot_labels)
-                plot_preds = np.array(plot_preds)
-                
-                fig, ax = plt.subplots(figsize=(12, 9))
-                scatter = ax.scatter(plot_labels, plot_preds, c=plot_colors, alpha=0.6, s=20, edgecolors='none')
-                ax.plot([0, 1], [0, 1], 'r--', alpha=0.8, linewidth=2)  # diagonal line
-                ax.set_xlabel('True DockQ', fontsize=12)
-                ax.set_ylabel('Predicted DockQ', fontsize=12)
-                ax.set_title(f'All Complexes: Prediction vs Target (Epoch {epoch})\n{num_complexes} complexes, {len(plot_preds)} points', fontsize=13)
-                ax.grid(True, alpha=0.3)
-                
-                # Add text annotation with statistics
-                correlation = np.corrcoef(plot_labels, plot_preds)[0, 1]
-                mae = np.mean(np.abs(plot_preds - plot_labels))
-                info_text = f'Complexes: {num_complexes}\nTotal points: {len(plot_preds)}\nCorrelation: {correlation:.3f}\nMAE: {mae:.4f}'
-                ax.text(0.05, 0.95, info_text, transform=ax.transAxes, 
-                        bbox=dict(boxstyle="round,pad=0.5", facecolor="white", alpha=0.9),
-                        verticalalignment='top', fontsize=10)
-                
-                all_complexes_table.add_data(epoch, wandb.Image(fig))
-                plt.close(fig)
-            
+                # Build validation log dictionary
+                val_log_dict = {
+                    # Core losses
+                    "val/loss": val_results['loss'],
+                    "val/regression_loss": val_results['regression_loss'],
+                    "val/ranking_loss": val_results['ranking_loss'],
+                    "val/distance_loss": val_results['distance_loss'],
+                    "val/avg_dockq": val_results['avg_dockq'],
 
-            
-            
-            val_log_dict = {
-                # Core losses
-                "val/loss": val_results['loss'],                     # Combined loss (scalar)
-                "val/regression_loss": val_results['regression_loss'],
-                "val/ranking_loss": val_results['ranking_loss'],
-                "val/distance_loss": val_results['distance_loss'],
-                "val/avg_dockq": val_results['avg_dockq'],
+                    # Histograms (media)
+                    "val/soft_rho_histogram_per_complex": wandb.Histogram(val_results['rho_soft_per_complex'], num_bins=50),
+                    "val/true_rho_histogram_per_complex": wandb.Histogram(val_results['rho_true_per_complex'], num_bins=50),
+                    "val/baseline_rho_soft_histogram_per_complex": wandb.Histogram(val_results['rho_baseline_per_complex'], num_bins=50),
+                    "val/delta_soft_rho_histogram_per_complex": wandb.Histogram(val_results['delta_soft_rho_per_complex'], num_bins=50),
+                    "val/delta_true_rho_histogram_per_complex": wandb.Histogram(val_results['delta_true_rho_per_complex'], num_bins=50),
+                    "val/abs_error_histogram": wandb.Histogram(abs_errors, num_bins=512),
 
-                # Histograms (media)
-                "val/soft_rho_histogram_per_complex": wandb.Histogram(val_results['rho_soft_per_complex'], num_bins=50),
-                "val/true_rho_histogram_per_complex": wandb.Histogram(val_results['rho_true_per_complex'], num_bins=50),
-                "val/baseline_rho_soft_histogram_per_complex": wandb.Histogram(val_results['rho_baseline_per_complex'], num_bins=50),
-                "val/delta_soft_rho_histogram_per_complex": wandb.Histogram(val_results['delta_soft_rho_per_complex'], num_bins=50),
-                "val/delta_true_rho_histogram_per_complex": wandb.Histogram(val_results['delta_true_rho_per_complex'], num_bins=50),
-                "val/abs_error_histogram": wandb.Histogram(abs_errors, num_bins=512),
+                    # Scalar summaries
+                    "val/soft_rho_mean": val_results['soft_rho_mean'],
+                    "val/true_rho_mean": val_results['true_rho_mean'],
+                    "val/baseline_rho_soft_mean": val_results['baseline_rho_mean'],
+                    "val/delta_soft_rho_mean": val_results['delta_soft_rho_mean'],
+                    "val/delta_true_rho_mean": val_results['delta_true_rho_mean'],
+                    "val/abs_error_mean": abs_err_mean_scalar,
+                    "val/abs_error_q25": float(np.percentile(abs_errors, 25)),
+                    "val/abs_error_q50": float(np.percentile(abs_errors, 50)),
+                    "val/abs_error_q75": float(np.percentile(abs_errors, 75)),
+                    "val/abs_error_max":  float(abs_errors.max()),
+                    "val/epoch": epoch,
+                }
+                
+                # Add ranking loss metrics if enabled
+                if add_rank_this_epoch:
+                    val_log_dict["val/ranking_loss"] = val_results['ranking_loss']
+                    val_log_dict["val/reg_vs_rank_loss_ratio"] = val_results['regression_loss'] / (val_results['ranking_loss'] + 1e-8)
+                    val_log_dict["val/ranking_lambda"] = ranking_lambda
+                
+                # Add distance loss metrics if enabled
+                if add_distance_this_epoch:
+                    val_log_dict["val/distance_loss"] = val_results['distance_loss']
+                    val_log_dict["val/reg_vs_distance_loss_ratio"] = val_results['regression_loss'] / (val_results['distance_loss'] + 1e-8)
+                    val_log_dict["val/distance_lambda"] = distance_lambda
 
-                # Scalar summaries (no lists)
-                "val/soft_rho_mean": val_results['soft_rho_mean'],
-                "val/true_rho_mean": val_results['true_rho_mean'],
-                "val/baseline_rho_soft_mean": val_results['baseline_rho_mean'],
-                "val/delta_soft_rho_mean": val_results['delta_soft_rho_mean'],
-                "val/delta_true_rho_mean": val_results['delta_true_rho_mean'],
-                "val/abs_error_mean": abs_err_mean_scalar,
-                "val/abs_error_q25": float(np.percentile(abs_errors, 25)),
-                "val/abs_error_q50": float(np.percentile(abs_errors, 50)),
-                "val/abs_error_q75": float(np.percentile(abs_errors, 75)),
-                "val/abs_error_max":  float(abs_errors.max()),
-                "val/epoch": epoch,
-            }
+            # broadcast scalar val_loss to every rank (sum of {x,0,0,...} -> x on all)
+            val_loss_t = torch.tensor(val_loss_scalar, device=fabric.device, dtype=torch.float32)
+            val_loss_t = fabric.all_reduce(val_loss_t, reduce_op="sum")
+            avg_val_loss = float(val_loss_t.item())
             
-            # Add ranking loss metrics if enabled
-            if add_rank_this_epoch:
-                val_log_dict["val/ranking_loss"] = val_results['ranking_loss']
-                val_log_dict["val/reg_vs_rank_loss_ratio"] = val_results['regression_loss'] / (val_results['ranking_loss'] + 1e-8)
-                val_log_dict["val/ranking_lambda"] = ranking_lambda
-            
-            # Add distance loss metrics if enabled
-            if add_distance_this_epoch:
-                val_log_dict["val/distance_loss"] = val_results['distance_loss']
-                val_log_dict["val/reg_vs_distance_loss_ratio"] = val_results['regression_loss'] / (val_results['distance_loss'] + 1e-8)
-                val_log_dict["val/distance_lambda"] = distance_lambda
-            
-            # Create training log dictionary
+            # Step ReduceLROnPlateau scheduler with validation loss
+            if scheduler_type == "ReduceLROnPlateau":
+                learning_rate_scheduler.step(avg_val_loss)
+
+        # ---- LOGGING (training metrics every epoch, validation metrics only when validation runs) ----
+        if fabric.global_rank == 0:
+            # Create training log dictionary (logged every epoch)
             train_log_dict = {
                 "train/loss": avg_epoch_loss,
                 "train/lr": optimizer.param_groups[0]['lr'],
@@ -970,7 +990,6 @@ def main():
                 "train/ranking_lambda": ranking_lambda,
                 "train/distance_lambda": distance_lambda,
                 "train/training_time_seconds": training_time,
-                "train/validation_time_seconds": validation_time,
                 "train/total_epoch_time_seconds": time.time() - epoch_start,
             }
             
@@ -984,24 +1003,26 @@ def main():
                 train_log_dict["train/distance_loss"] = avg_epoch_distance_loss
                 train_log_dict["train/reg_vs_distance_loss_ratio"] = avg_epoch_regression_loss / (avg_epoch_distance_loss + 1e-8)
             
-            # Combine train and validation logs
-            combined_log_dict = {**train_log_dict, **val_log_dict}
-            
-            wandb.log(combined_log_dict, step=epoch)
-            wandb.log({
-                "val/per_complex_pred_vs_target": per_complex_table,
-                "val/all_complexes_pred_vs_target": all_complexes_table,})
-        # broadcast scalar val_loss to every rank (sum of {x,0,0,...} -> x on all)
-        val_loss_t = torch.tensor(val_loss_scalar, device=fabric.device, dtype=torch.float32)
-        val_loss_t = fabric.all_reduce(val_loss_t, reduce_op="sum")
-        avg_val_loss = float(val_loss_t.item())
-        if scheduler_type == "ReduceLROnPlateau":
-            learning_rate_scheduler.step(avg_val_loss)
+            # Combine with validation logs if validation was run this epoch
+            if run_validation_this_epoch:
+                train_log_dict["train/validation_time_seconds"] = validation_time
+                combined_log_dict = {**train_log_dict, **val_log_dict}
+                wandb.log(combined_log_dict, step=epoch)
+                wandb.log({
+                    "val/per_complex_pred_vs_target": per_complex_table,
+                    "val/all_complexes_pred_vs_target": all_complexes_table,
+                })
+            else:
+                # Log only training metrics
+                wandb.log(train_log_dict, step=epoch)
         
-        # Only print on rank 0
+        # Print epoch summary (only on rank 0)
         if fabric.global_rank == 0:
             total_epoch_time = time.time() - epoch_start
-            epoch_print_msg = f"Epoch {epoch}/{epochs}, Total time: {total_epoch_time:.2f}s (Train: {training_time:.2f}s, Val: {validation_time:.2f}s), Train loss: {avg_epoch_loss:.8f} —  Val loss: {avg_val_loss:.8f} —  Val abs error mean: {abs_err_mean_scalar:.8f} - regression loss: {avg_epoch_regression_loss:.8f}"
+            if run_validation_this_epoch:
+                epoch_print_msg = f"Epoch {epoch}/{epochs}, Total time: {total_epoch_time:.2f}s (Train: {training_time:.2f}s, Val: {validation_time:.2f}s), Train loss: {avg_epoch_loss:.8f} — Val loss: {avg_val_loss:.8f} — Val abs error mean: {abs_err_mean_scalar:.8f} - regression loss: {avg_epoch_regression_loss:.8f}"
+            else:
+                epoch_print_msg = f"Epoch {epoch}/{epochs}, Total time: {total_epoch_time:.2f}s (Train: {training_time:.2f}s), Train loss: {avg_epoch_loss:.8f} - regression loss: {avg_epoch_regression_loss:.8f}"
             if add_rank_this_epoch:
                 epoch_print_msg += f" - ranking loss: {avg_epoch_ranking_loss:.8f}"
             if add_distance_this_epoch:
@@ -1365,3 +1386,4 @@ def train_step(model, batch, optimizer, base_criterion, device,
 
 if __name__ == '__main__':
     main()
+

@@ -1,1 +1,1 @@
-/proj/berzelius-2021-29/users/x_matta/abag/output_new_multigpu/DeepSet_2025-10-06_21-55-13_aggregator_concat_stats_by_set_size_lr_scheduler_OneCycleLR_maxlr_0.005_epochs_250_steps_per_epoch_22/checkpoint_epoch20.pt
+/proj/berzelius-2021-29/users/x_matta/abag/output_ablation/DeepSet_2025-12-10_19-59-38_aggregator_attn_pool_concat_stats_lr_scheduler_OneCycleLR_maxlr_0.005_epochs_300_steps_per_epoch_27/checkpoint_epoch170.pt
